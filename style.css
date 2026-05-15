@@ -110,11 +110,11 @@ main {
 }
 
 .period-value {
-  font-family: var(--mono);
-  font-size: 2.5rem;
+  font-family: var(--serif);
+  font-size: 2.2rem;
   font-weight: 500;
   color: var(--ink);
-  letter-spacing: 0.02em;
+  letter-spacing: -0.01em;
   line-height: 1.1;
 }
 
@@ -289,12 +289,13 @@ main {
 }
 
 /* Shared grid template for header, each person row's summary, and the total row.
-   Columns: Name (flex) | Role tag | Lines | Total */
+   Columns: Name (flex) | Review flag | Lines | Total
+   (Role column removed — people wear multiple hats.) */
 .people-header,
 .person-row > summary,
 .people-total {
   display: grid;
-  grid-template-columns: 1fr 7rem 4rem 9rem;
+  grid-template-columns: 1fr 3.5rem 4rem 9rem;
   align-items: center;
   gap: 1rem;
   padding: 0.7rem 1rem;
@@ -375,6 +376,31 @@ main {
   background: var(--bg);
 }
 
+/* Review flag column (summary table) */
+.flag-col {
+  text-align: center;
+  font-size: 1rem;
+  line-height: 1;
+}
+.people-header .flag-col {
+  color: var(--ink-muted);
+  opacity: 0.5;
+}
+
+/* Flag cell (drill-down table) — same width, narrow */
+.detail-table th.flag-cell,
+.detail-table td.flag-cell {
+  width: 2rem;
+  text-align: center;
+  padding: 0.55rem 0.4rem;
+}
+
+.detail-table .summary-cell {
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  line-height: 1.4;
+}
+
 .people-total {
   background: var(--ink);
   color: var(--bg);
@@ -438,17 +464,17 @@ footer code {
   .people-header,
   .person-row > summary,
   .people-total {
-    grid-template-columns: 1fr 4rem 7rem;
+    grid-template-columns: 1fr 2.5rem 7rem;
     padding: 0.55rem 0.7rem;
     gap: 0.5rem;
   }
-  /* Hide the Lines column on narrow screens; total stays right-most */
-  .people-header > span:nth-child(3),
+  /* Hide the Lines column on narrow screens; review flag + total stay */
+  .people-header > .num:first-of-type,
   .person-row > summary > .num:first-of-type,
   .people-total > span:nth-child(3) { display: none; }
-  .role-tag { font-size: 0.65rem; padding: 0.15rem 0.35rem; }
   .detail-table th, .detail-table td { padding: 0.4rem 0.55rem; font-size: 0.78rem; }
+  .detail-table .summary-cell { font-size: 0.72rem; }
   .brand-mark { font-size: 2rem; }
   .brand-text h1 { font-size: 1.4rem; }
-  .period-value { font-size: 2rem; }
+  .period-value { font-size: 1.5rem; }
 }
