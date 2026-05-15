@@ -1122,22 +1122,65 @@ function renderResults(entries, period) {
     html += `<span class="num">${fmtUSD(v.total)}</span>`;
     html += `</summary>`;
 
-    // Drill-down: aggregate by type, not one row per line. For Juan-style
-    // cases (38 separate $1 leads), this collapses to "38 × $1 = $38" in
-    // a single row.
+    // Drill-down: per-deal rows for everything coming from Contracted Deals,
+    // Sales, and Monthly Comm Outreach Sales. For Approved Leads (Per-Lead
+    // bonuses) we still aggregate by type — a LIM can have 50+ approved leads
+    // in a month and listing them individually is noise.
+    const perLeadByType = {};
+    const individualEntries = [];
+    for (const e of personEntries) {
+      if (/^Per-Lead/.test(e.type)) {
+        if (!perLeadByType[e.type]) perLeadByType[e.type] = [];
+        perLeadByType[e.type].push(e);
+      } else {
+        individualEntries.push(e);
+      }
+    }
+    // Sort individual rows by type, then source, so all LAM Advances cluster
+    // together, all LIA Closings cluster together, etc.
+    individualEntries.sort((a, b) =>
+      a.type.localeCompare(b.type) || String(a.source || '').localeCompare(String(b.source || ''))
+    );
+    const perLeadTypes = Object.keys(perLeadByType).sort();
+
     html += '<div class="person-row-body">';
     html += '<table class="detail-table"><thead><tr>';
-    html += '<th>Type</th><th class="num">Lines</th><th class="num">Total</th><th>Summary</th>';
+    html += '<th>Type</th><th>Source</th><th class="num">Amount</th><th>Calculation</th>';
     html += '</tr></thead><tbody>';
-    for (const g of groupByType(personEntries)) {
-      const flagClass = g.hasReview ? 'flag-review' : 'flag-ok';
+
+    // Individual rows — one per deal/contract/listing.
+    for (const e of individualEntries) {
+      const flagClass = e.flag === 'REVIEW' ? 'flag-review' : 'flag-ok';
       html += `<tr class="${flagClass}">`;
-      html += `<td>${escapeHTML(g.type)}</td>`;
-      html += `<td class="num">${g.count}</td>`;
-      html += `<td class="num">${fmtUSD(g.total)}</td>`;
-      html += `<td class="summary-cell">${escapeHTML(describeGroup(g))}</td>`;
+      html += `<td>${escapeHTML(e.type)}</td>`;
+      html += `<td class="src-cell">${escapeHTML(e.source)}</td>`;
+      html += `<td class="num">${fmtUSD(e.amount)}</td>`;
+      html += `<td class="summary-cell">${escapeHTML(e.calc)}</td>`;
       html += `</tr>`;
     }
+
+    // Aggregated Per-Lead rows — one per category (Phone Fully Q, etc.).
+    for (const type of perLeadTypes) {
+      const ents = perLeadByType[type];
+      const total = ents.reduce((s, e) => s + e.amount, 0);
+      const count = ents.length;
+      const hasReview = ents.some(e => e.flag === 'REVIEW');
+      const flagClass = hasReview ? 'flag-review' : 'flag-ok';
+      const amounts = [...new Set(ents.map(e => e.amount))];
+      let calc;
+      if (amounts.length === 1) {
+        calc = `${count} approved lead${count === 1 ? '' : 's'} × ${fmtUSD(amounts[0])} = ${fmtUSD(total)}`;
+      } else {
+        calc = `${count} approved leads, varying amounts = ${fmtUSD(total)}`;
+      }
+      html += `<tr class="${flagClass}">`;
+      html += `<td>${escapeHTML(type)}</td>`;
+      html += `<td class="src-cell">${count} lead${count === 1 ? '' : 's'}</td>`;
+      html += `<td class="num">${fmtUSD(total)}</td>`;
+      html += `<td class="summary-cell">${escapeHTML(calc)}</td>`;
+      html += `</tr>`;
+    }
+
     html += '</tbody></table>';
 
     // Per-person manual review list — appears under the calc table so
@@ -1199,50 +1242,6 @@ function renderResults(entries, period) {
   flagsEl.innerHTML = flagsHTML;
 
   document.getElementById('results').classList.remove('hidden');
-}
-
-// Group a person's entries by type. For drill-down summary.
-// Tracks whether any entry in the group is REVIEW (for the flag indicator).
-function groupByType(entries) {
-  const groups = {};
-  for (const e of entries) {
-    const key = e.type || '(unknown)';
-    if (!groups[key]) {
-      groups[key] = {
-        type: key,
-        count: 0,
-        total: 0,
-        hasReview: false,
-        amounts: new Set(),
-        firstCalc: e.calc,
-        firstNotes: e.notes,
-      };
-    }
-    groups[key].count += 1;
-    groups[key].total += e.amount;
-    if (e.flag === 'REVIEW') groups[key].hasReview = true;
-    groups[key].amounts.add(Math.round(e.amount * 100));  // dedupe to cents
-  }
-  return Object.values(groups).sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
-}
-
-// Produce a concise human-readable summary for a group of entries.
-//   - Single entry: use its full calc string
-//   - Multiple entries, all same amount: "N × $X = $total"
-//   - Multiple entries, varying amounts: brief "N lines, varying" note
-// REVIEW-flagged groups get an inline note pulled from the first entry's
-// notes/calc (e.g., the QoC gate caveat for LPA/LLP).
-function describeGroup(g) {
-  if (g.count === 1) return g.firstCalc || '—';
-  if (g.amounts.size === 1) {
-    const each = g.total / g.count;
-    let s = `${g.count} × ${fmtUSD(each)} = ${fmtUSD(g.total)}`;
-    if (g.hasReview && g.firstNotes) s += ` — ${g.firstNotes}`;
-    return s;
-  }
-  let s = `${g.count} lines, varying amounts`;
-  if (g.hasReview && g.firstNotes) s += ` — ${g.firstNotes}`;
-  return s;
 }
 
 function escapeHTML(s) {
