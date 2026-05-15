@@ -39,29 +39,104 @@ const TAB_OUTREACH_SALES = 'Monthly Comm Outreach / Sales';
 const TAB_APPROVED_LEADS = 'Approved Leads';
 const TAB_SALES          = 'Sales';
 const TAB_CONTRACTED     = 'Contracted Deals';
+const TAB_PEOPLE         = 'People';
+const TAB_FINANCE        = 'Finance';
 
 /* ------------------------------------------------------------
-   1. PEOPLE — edit when staffing changes
+   1. PEOPLE — populated at runtime from the People tab in the sheet
+   ----------------------------------------------------------------
+   v1.1: HR maintains the roster directly in Google Sheets (no code
+   commits needed). Sheet columns:
+     Person Name | Status | Manager | Is Outreach Manager
+
+   Eligibility model (replaces old hire/separation-date logic):
+     - In roster + Status=Active   → paid
+     - In roster + Status=Inactive → INELIGIBLE ($0)
+     - NOT in roster               → INELIGIBLE ($0) + "add to People
+                                      tab if they should be paid" flag
+
+   Status=Inactive and not-in-roster behave the same way at payout
+   time, but the flag text differs so HR can see new names that may
+   have been overlooked vs. people who were intentionally excluded.
    ------------------------------------------------------------ */
-const PEOPLE = {
-  // 'Person Name': { hireDate, separationDate, manager, isOutreachManager? }
-  'Pracy Ann Pryce':    { hireDate: '2025-04-01', separationDate: null, manager: null },
-  'Gabriel Santos':     { hireDate: '2025-04-01', separationDate: null, manager: null },  // sole active LPM
-  'Art Oaing':          { hireDate: '2025-03-01', separationDate: null, manager: null },
-  'Leslie Bernolo':     { hireDate: '2025-03-01', separationDate: null, manager: null },
-  // LIA/LIM team — add real names here
-  // 'Mariam Farouk':   { hireDate: '2025-08-01', separationDate: null, manager: 'Juan Pablo Larrea' },
-  // 'Juan Pablo Larrea': { hireDate: '2025-06-01', separationDate: null, manager: null, isOutreachManager: true },
-};
+let PEOPLE = {};
 
 const LTC_DEFAULT_PERSON = 'Pracy Ann Pryce';
 
+function parseStatus(v) {
+  const s = (v == null ? '' : String(v)).trim().toLowerCase();
+  // Default to Active if blank or unrecognized — the row's presence in
+  // the roster signals intent to track them; blank Status means HR added
+  // them but hasn't filled in everything yet.
+  return s === 'inactive' ? 'Inactive' : 'Active';
+}
+
+function parseManager(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  const low = s.toLowerCase();
+  if (low === 'n/a' || low === 'na' || low === 'none' || low === '-') return null;
+  return s;
+}
+
+function parseOutreachMgr(v) {
+  if (v === true) return true;
+  if (v === false || v == null) return false;
+  const s = String(v).trim().toLowerCase();
+  return s === 'true' || s === 'yes' || s === 'y' || s === '1';
+}
+
+function buildPeopleFromSheet(peopleRows) {
+  const people = {};
+  for (const row of (peopleRows || [])) {
+    // Be flexible on the header name — accept Person Name, Name, etc.
+    const name = String(row['Person Name'] || row['Name'] || row['Person'] || '').trim();
+    if (!name) continue;
+    people[name] = {
+      status: parseStatus(row['Status']),
+      manager: parseManager(row['Manager']),
+      isOutreachManager: parseOutreachMgr(row['Is Outreach Manager'] || row['Outreach Manager']),
+    };
+  }
+  return people;
+}
+
 /* ------------------------------------------------------------
-   2. FINANCE — edit monthly when financials close
+   2. FINANCE — populated at runtime from the Finance tab in the sheet
+   ----------------------------------------------------------------
+   v1.1: monthly revenue and NOI moved out of script.js into the sheet.
+   Sheet columns:
+     Period | Revenue | NOI
+
+   Period is a YYYY-MM string. If you accidentally enter '2026-04-01'
+   (Sheets auto-formats some inputs as dates), the parser strips it to
+   '2026-04' so calcs still work.
+
+   An empty Finance tab is fine — calcNOITiered emits a REVIEW flag
+   noting the missing period entry; it doesn't crash.
    ------------------------------------------------------------ */
-const FINANCE = {
-  // 'YYYY-MM': { revenue, noi }
-};
+let FINANCE = {};
+
+function parsePeriodKey(v) {
+  if (v == null) return null;
+  // Apps Script serializes Date cells as 'YYYY-MM-DD'. Either way, slice to YYYY-MM.
+  const s = String(v).trim();
+  const m = s.match(/^(\d{4}-\d{2})/);
+  return m ? m[1] : null;
+}
+
+function buildFinanceFromSheet(rows) {
+  const out = {};
+  for (const row of (rows || [])) {
+    const key = parsePeriodKey(row['Period'] || row['Month']);
+    if (!key) continue;
+    const revenue = parseMoney(row['Revenue']);
+    const noi = parseMoney(row['NOI'] || row['Net Operating Income']);
+    out[key] = { revenue, noi };
+  }
+  return out;
+}
 
 /* ------------------------------------------------------------
    3. COMMISSION RULE TABLES
@@ -176,16 +251,31 @@ function tierFor(amount, tiers) {
   return null;
 }
 
-// Lighter eligibility check — only enforces forfeit-on-separation.
-// People not in roster get REVIEW (not INELIGIBLE) so HR can fix without
-// dropping someone's pay.
+// v1.1 eligibility check — reads Status from the People tab.
+//   In roster + Active   → paid normally
+//   In roster + Inactive → INELIGIBLE ($0, "marked Inactive" flag)
+//   NOT in roster        → INELIGIBLE ($0, "add to People tab" flag)
+//
+// The dealDate parameter is preserved for compatibility (some callers
+// pass it) but is no longer used — temporal forfeit logic was replaced
+// with status-based logic per Anshul, May 2026. If forfeit-on-separation
+// with a specific date is ever needed again, add a Separation Date
+// column to the People tab and reintroduce date math here.
 function checkSeparationOnly(personName, dealDate) {
   const p = PEOPLE[personName];
-  if (!p) return { eligible: true, reason: `Not in roster: "${personName}"`, flag: 'REVIEW' };
-  const sd = p.separationDate ? parseDate(p.separationDate) : null;
-  const dd = parseDate(dealDate);
-  if (sd && dd && dd > sd) {
-    return { eligible: false, reason: `Forfeited — separated ${ymKey(sd)}, deal ${ymKey(dd)}`, flag: 'INELIGIBLE' };
+  if (!p) {
+    return {
+      eligible: false,
+      reason: `Not in People tab. Add "${personName}" with Status=Active to pay; otherwise leave off (treated as inactive).`,
+      flag: 'INELIGIBLE',
+    };
+  }
+  if (p.status === 'Inactive') {
+    return {
+      eligible: false,
+      reason: `Marked Inactive in People tab.`,
+      flag: 'INELIGIBLE',
+    };
   }
   return { eligible: true, reason: null, flag: 'OK' };
 }
@@ -272,13 +362,13 @@ function calcLAMAdvances(contractedDeals, period) {
         continue;
       }
       const p = PEOPLE[owner];
-      const sd = p && p.separationDate ? parseDate(p.separationDate) : null;
-      if (sd) {
+      if (!p || p.status === 'Inactive') {
+        const reason = !p
+          ? `${owner} not in People tab — treated as inactive, not chasing former employees.`
+          : `${owner} marked Inactive in People tab — not chasing former employees.`;
         entries.push({
           person: owner, role: 'LAM', period, source: contractId, type: 'LAM Retraction',
-          amount: 0, calc: '—',
-          notes: `Retraction skipped — ${owner} separated ${ymKey(sd)}. Not chasing former employees.`,
-          flag: 'REVIEW',
+          amount: 0, calc: '—', notes: `Retraction skipped — ${reason}`, flag: 'REVIEW',
         });
         continue;
       }
@@ -801,7 +891,7 @@ function calcNOITiered(period) {
       person: '—', role: 'DOA PH / DOT', period, source: 'monthly',
       type: 'NOI Tiered',
       amount: 0, calc: '—',
-      notes: `No Finance entry for period ${period}. Add to FINANCE in script.js.`,
+      notes: `No Finance entry for period ${period}. Add a row to the Finance tab (Period: ${period}, Revenue: …, NOI: …) and re-run.`,
       flag: 'REVIEW',
     });
     return entries;
@@ -857,11 +947,21 @@ async function fetchSheetData() {
   const body = await res.json();
   if (body.error) throw new Error(`Apps Script: ${body.error}`);
   // Per-tab errors
-  for (const tab of [TAB_OUTREACH_SALES, TAB_APPROVED_LEADS, TAB_SALES, TAB_CONTRACTED]) {
+  for (const tab of [TAB_OUTREACH_SALES, TAB_APPROVED_LEADS, TAB_SALES, TAB_CONTRACTED, TAB_PEOPLE, TAB_FINANCE]) {
     const v = body[tab];
     if (v && v.error) throw new Error(`Tab "${tab}": ${v.error}`);
     if (!v) throw new Error(`Tab "${tab}" missing from response`);
   }
+  // Hydrate PEOPLE roster from the People tab BEFORE any calc runs.
+  PEOPLE = buildPeopleFromSheet(body[TAB_PEOPLE]);
+  if (Object.keys(PEOPLE).length === 0) {
+    throw new Error(
+      `People tab is empty. Add at least one row (Person Name + Status=Active) ` +
+      `or the calculator will mark every commission line INELIGIBLE.`
+    );
+  }
+  // Hydrate FINANCE from the Finance tab. Empty is OK — calcNOITiered flags the gap.
+  FINANCE = buildFinanceFromSheet(body[TAB_FINANCE]);
   return body;
 }
 
