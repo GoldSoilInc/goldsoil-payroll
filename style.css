@@ -18,9 +18,9 @@
   --warning-bg: #FBF3D9;
   --warning-border: #DCBE6E;
 
-  --serif: 'IBM Plex Serif', Georgia, serif;
-  --sans: 'IBM Plex Sans', system-ui, sans-serif;
-  --mono: 'IBM Plex Mono', 'Courier New', monospace;
+  --serif: 'Inter', system-ui, -apple-system, sans-serif;
+  --sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
 
   --content-max: 1100px;
   --gutter: 2rem;
@@ -36,7 +36,9 @@ body {
   background: var(--bg);
   color: var(--ink);
   font-family: var(--sans);
-  font-feature-settings: 'tnum';
+  font-feature-settings: 'tnum', 'ss01', 'cv11';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   line-height: 1.5;
   min-height: 100vh;
 }
@@ -409,6 +411,15 @@ main {
   font-size: 0.82rem;
   color: var(--ink-soft);
   line-height: 1.4;
+}
+
+/* Source column (drill-down) — deal IDs, contract IDs, listing numbers.
+   Mono + slightly smaller so they read as references, not text. */
+.detail-table .src-cell {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  white-space: nowrap;
+  color: var(--ink);
 }
 
 /* Per-person manual review list — appears under the calc table */
