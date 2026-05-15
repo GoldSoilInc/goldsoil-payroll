@@ -228,6 +228,18 @@ function ymKey(date) {
   return `${y}-${m}`;
 }
 
+// Display-friendly period name: '2026-04' → 'April 2026'.
+// Internal/storage format stays YYYY-MM for sortability + CSV filenames.
+function fmtPeriodName(period) {
+  if (!period) return '';
+  const [yearStr, monthStr] = String(period).split('-');
+  const m = parseInt(monthStr, 10);
+  if (isNaN(m) || m < 1 || m > 12) return period;
+  const months = ['January', 'February', 'March', 'April', 'May', 'June',
+                  'July', 'August', 'September', 'October', 'November', 'December'];
+  return `${months[m - 1]} ${yearStr}`;
+}
+
 function inPeriod(dateStr, period) {
   const d = parseDate(dateStr);
   return d && ymKey(d) === period;
@@ -988,39 +1000,62 @@ function renderResults(entries, period) {
   const detailEl  = document.getElementById('detail');
   const flagsEl   = document.getElementById('flags');
 
+  // Aggregate by person. Skip:
+  //   - INELIGIBLE entries (handled by the Flags panel)
+  //   - Unattributed entries (person === '—'); these are SF data hygiene
+  //     issues, not real payouts, and shouldn't clutter the table.
   const byPerson = {};
   for (const e of entries) {
     if (e.flag === 'INELIGIBLE') continue;
-    if (!byPerson[e.person]) byPerson[e.person] = { role: e.role, total: 0, count: 0 };
+    if (!e.person || e.person === '—') continue;
+    if (!byPerson[e.person]) byPerson[e.person] = { total: 0, count: 0, hasReview: false };
     byPerson[e.person].total += e.amount;
     byPerson[e.person].count += 1;
+    if (e.flag === 'REVIEW') byPerson[e.person].hasReview = true;
   }
   const sortedPeople = Object.entries(byPerson).sort((a, b) => b[1].total - a[1].total);
   const grandTotal = sortedPeople.reduce((s, [, v]) => s + v.total, 0);
 
-  let html = `<div class="period-banner">Period: <strong>${period}</strong> &nbsp;·&nbsp; Grand Total: <strong>${fmtUSD(grandTotal)}</strong></div>`;
+  let html = `<div class="period-banner">Period: <strong>${escapeHTML(fmtPeriodName(period))}</strong> &nbsp;·&nbsp; Grand Total: <strong>${fmtUSD(grandTotal)}</strong></div>`;
 
-  // Combined expandable list: each person row is a <details>.
-  // Click the person's name (or anywhere on the row) to expand their breakdown.
+  // Summary table — Person · Review · Lines · Total. Role column dropped
+  // (people wear multiple hats). Review column shows 🚩 if any of the
+  // person's lines are REVIEW.
   html += '<div class="people-list">';
   html += '<div class="people-header">';
-  html += '<span>Person</span><span>Role</span>';
-  html += '<span class="num">Lines</span><span class="num">Total</span>';
+  html += '<span>Person</span>';
+  html += '<span class="flag-col" title="Manual review needed">⚑</span>';
+  html += '<span class="num">Lines</span>';
+  html += '<span class="num">Total</span>';
   html += '</div>';
 
   for (const [person, v] of sortedPeople) {
     const personEntries = entries.filter(e => e.person === person && e.flag !== 'INELIGIBLE');
     if (personEntries.length === 0) continue;
-    html += `<details class="person-row">`;
+    html += `<details class="person-row${v.hasReview ? ' has-review' : ''}">`;
     html += `<summary>`;
     html += `<span class="name">${escapeHTML(person)}</span>`;
-    html += `<span class="role-tag">${escapeHTML(v.role)}</span>`;
+    html += `<span class="flag-col">${v.hasReview ? '🚩' : ''}</span>`;
     html += `<span class="num">${v.count}</span>`;
     html += `<span class="num">${fmtUSD(v.total)}</span>`;
     html += `</summary>`;
-    html += '<div class="person-row-body"><table class="detail-table"><thead><tr><th>Source</th><th>Type</th><th>Calculation</th><th>Notes</th><th class="num">Amount</th></tr></thead><tbody>';
-    for (const e of personEntries) {
-      html += `<tr class="flag-${e.flag.toLowerCase()}"><td>${escapeHTML(e.source)}</td><td>${escapeHTML(e.type)}</td><td>${escapeHTML(e.calc)}</td><td>${escapeHTML(e.notes)}</td><td class="num">${fmtUSD(e.amount)}</td></tr>`;
+
+    // Drill-down: aggregate by type, not one row per line. For Juan-style
+    // cases (38 separate $1 leads), this collapses to "38 × $1 = $38" in
+    // a single row.
+    html += '<div class="person-row-body">';
+    html += '<table class="detail-table"><thead><tr>';
+    html += '<th class="flag-cell"></th><th>Type</th><th class="num">Lines</th><th class="num">Total</th><th>Summary</th>';
+    html += '</tr></thead><tbody>';
+    for (const g of groupByType(personEntries)) {
+      const flagClass = g.hasReview ? 'flag-review' : 'flag-ok';
+      html += `<tr class="${flagClass}">`;
+      html += `<td class="flag-cell">${g.hasReview ? '🚩' : ''}</td>`;
+      html += `<td>${escapeHTML(g.type)}</td>`;
+      html += `<td class="num">${g.count}</td>`;
+      html += `<td class="num">${fmtUSD(g.total)}</td>`;
+      html += `<td class="summary-cell">${escapeHTML(describeGroup(g))}</td>`;
+      html += `</tr>`;
     }
     html += '</tbody></table></div></details>';
   }
@@ -1031,11 +1066,13 @@ function renderResults(entries, period) {
   summaryEl.innerHTML = html;
   if (detailEl) detailEl.innerHTML = '';  // legacy container, now empty
 
-  const reviewEntries = entries.filter(e => e.flag === 'REVIEW');
+  // Flags panel — exclude '—' entries (data hygiene issues) per user request.
+  // Keep named-person REVIEW (e.g., LPA QoC verify) and all INELIGIBLE.
+  const reviewEntries = entries.filter(e => e.flag === 'REVIEW' && e.person !== '—' && e.person);
   const ineligibleEntries = entries.filter(e => e.flag === 'INELIGIBLE');
   let flagsHTML = '';
   if (reviewEntries.length > 0) {
-    flagsHTML += `<h3 class="flag-h">⚠ Manual Review Needed (${reviewEntries.length})</h3><ul>`;
+    flagsHTML += `<h3 class="flag-h">🚩 Manual Review Needed (${reviewEntries.length})</h3><ul>`;
     for (const e of reviewEntries) {
       flagsHTML += `<li><strong>${escapeHTML(e.person)} / ${escapeHTML(e.type)}</strong> — ${escapeHTML(e.source)}: ${escapeHTML(e.notes || e.calc)}</li>`;
     }
@@ -1052,6 +1089,50 @@ function renderResults(entries, period) {
   flagsEl.innerHTML = flagsHTML;
 
   document.getElementById('results').classList.remove('hidden');
+}
+
+// Group a person's entries by type. For drill-down summary.
+// Tracks whether any entry in the group is REVIEW (for the flag indicator).
+function groupByType(entries) {
+  const groups = {};
+  for (const e of entries) {
+    const key = e.type || '(unknown)';
+    if (!groups[key]) {
+      groups[key] = {
+        type: key,
+        count: 0,
+        total: 0,
+        hasReview: false,
+        amounts: new Set(),
+        firstCalc: e.calc,
+        firstNotes: e.notes,
+      };
+    }
+    groups[key].count += 1;
+    groups[key].total += e.amount;
+    if (e.flag === 'REVIEW') groups[key].hasReview = true;
+    groups[key].amounts.add(Math.round(e.amount * 100));  // dedupe to cents
+  }
+  return Object.values(groups).sort((a, b) => Math.abs(b.total) - Math.abs(a.total));
+}
+
+// Produce a concise human-readable summary for a group of entries.
+//   - Single entry: use its full calc string
+//   - Multiple entries, all same amount: "N × $X = $total"
+//   - Multiple entries, varying amounts: brief "N lines, varying" note
+// REVIEW-flagged groups get an inline note pulled from the first entry's
+// notes/calc (e.g., the QoC gate caveat for LPA/LLP).
+function describeGroup(g) {
+  if (g.count === 1) return g.firstCalc || '—';
+  if (g.amounts.size === 1) {
+    const each = g.total / g.count;
+    let s = `${g.count} × ${fmtUSD(each)} = ${fmtUSD(g.total)}`;
+    if (g.hasReview && g.firstNotes) s += ` — ${g.firstNotes}`;
+    return s;
+  }
+  let s = `${g.count} lines, varying amounts`;
+  if (g.hasReview && g.firstNotes) s += ` — ${g.firstNotes}`;
+  return s;
 }
 
 function escapeHTML(s) {
@@ -1118,7 +1199,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const period = previousMonthKey();
   lastPeriod = period;
-  periodDisplay.textContent = period;
+  periodDisplay.textContent = fmtPeriodName(period);
 
   calcBtn.addEventListener('click', async () => {
     calcBtn.classList.add('loading');
