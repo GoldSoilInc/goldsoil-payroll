@@ -295,7 +295,7 @@ main {
 .person-row > summary,
 .people-total {
   display: grid;
-  grid-template-columns: 1fr 3.5rem 4rem 9rem;
+  grid-template-columns: minmax(8rem, 1.1fr) 3rem minmax(0, 2.2fr) 8rem;
   align-items: center;
   gap: 1rem;
   padding: 0.7rem 1rem;
@@ -387,18 +387,66 @@ main {
   opacity: 0.5;
 }
 
-/* Flag cell (drill-down table) — same width, narrow */
-.detail-table th.flag-cell,
-.detail-table td.flag-cell {
-  width: 2rem;
-  text-align: center;
-  padding: 0.55rem 0.4rem;
+/* Breakdown column — per-type subtotals shown in the summary row.
+   Slightly smaller font + soft color so it reads as supporting info,
+   not the headline number. */
+.breakdown-col {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.people-header > span:nth-child(3) {
+  font-family: var(--serif);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-soft);
 }
 
 .detail-table .summary-cell {
   font-size: 0.82rem;
   color: var(--ink-soft);
   line-height: 1.4;
+}
+
+/* Per-person manual review list — appears under the calc table */
+.person-review-list {
+  padding: 0.9rem 1.25rem 1.1rem;
+  background: var(--warning-bg);
+  border-top: 1px solid var(--warning-border);
+}
+
+.person-review-h {
+  font-family: var(--serif);
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--accent);
+  margin-bottom: 0.5rem;
+}
+
+.person-review-list ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.person-review-list li {
+  font-size: 0.85rem;
+  line-height: 1.45;
+  margin-bottom: 0.3rem;
+  color: var(--ink);
+}
+
+.person-review-list li strong {
+  font-family: var(--serif);
+  color: var(--ink);
+}
+
+.person-review-list .src {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
 }
 
 .people-total {
@@ -468,9 +516,10 @@ footer code {
     padding: 0.55rem 0.7rem;
     gap: 0.5rem;
   }
-  /* Hide the Lines column on narrow screens; review flag + total stay */
-  .people-header > .num:first-of-type,
-  .person-row > summary > .num:first-of-type,
+  /* Hide the Breakdown column on narrow screens — it's too long to fit
+     gracefully. Expand a row to see the same info in the drill-down. */
+  .people-header > span:nth-child(3),
+  .person-row > summary > .breakdown-col,
   .people-total > span:nth-child(3) { display: none; }
   .detail-table th, .detail-table td { padding: 0.4rem 0.55rem; font-size: 0.78rem; }
   .detail-table .summary-cell { font-size: 0.72rem; }
