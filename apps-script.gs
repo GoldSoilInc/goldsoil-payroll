@@ -21,8 +21,8 @@
    ============================================================ */
 
 // CONFIG — fill these in before deploying
-const SHEET_ID = 'PASTE_YOUR_GOOGLE_SHEET_ID_HERE';
-const TOKEN    = 'PASTE_A_LONG_RANDOM_STRING_HERE';
+const SHEET_ID = '1o2OPoWiX22tv5p_C6Be88_srkGmg6cI_zSLA1mIRwvI';
+const TOKEN    = '9EMY8RYSE5WUISFY2ZOBADP9F2FIOCDL';
 
 // Tabs we expect to find. Names must match the Sheet exactly.
 const TABS = [
