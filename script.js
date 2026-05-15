@@ -73,7 +73,7 @@ function parseStatus(v) {
 
 function parseManager(v) {
   if (v == null) return null;
-  const s = String(v).trim();
+  const s = normalizeName(v);
   if (!s) return null;
   const low = s.toLowerCase();
   if (low === 'n/a' || low === 'na' || low === 'none' || low === '-') return null;
@@ -87,11 +87,37 @@ function parseOutreachMgr(v) {
   return s === 'true' || s === 'yes' || s === 'y' || s === '1';
 }
 
+// Normalize a person's name for roster lookup. Trims leading/trailing
+// whitespace AND collapses internal multi-spaces to a single space.
+// Case is preserved. This catches the most common typos that would
+// otherwise make a real roster entry fail to match its SF attribution
+// (e.g., "Whitney  Simpson" with a double space vs. "Whitney Simpson").
+function normalizeName(s) {
+  if (s == null) return '';
+  return String(s).replace(/\s+/g, ' ').trim();
+}
+
+// Look up a person in the PEOPLE roster. Tries:
+//   1. exact normalized match (handles whitespace differences)
+//   2. case-insensitive match (handles casing differences)
+// Returns the PEOPLE entry or null if no match.
+function lookupPerson(rawName) {
+  if (!rawName) return null;
+  const normalized = normalizeName(rawName);
+  if (!normalized) return null;
+  if (PEOPLE[normalized]) return PEOPLE[normalized];
+  const lower = normalized.toLowerCase();
+  for (const key of Object.keys(PEOPLE)) {
+    if (key.toLowerCase() === lower) return PEOPLE[key];
+  }
+  return null;
+}
+
 function buildPeopleFromSheet(peopleRows) {
   const people = {};
   for (const row of (peopleRows || [])) {
     // Be flexible on the header name — accept Person Name, Name, etc.
-    const name = String(row['Person Name'] || row['Name'] || row['Person'] || '').trim();
+    const name = normalizeName(row['Person Name'] || row['Name'] || row['Person'] || '');
     if (!name) continue;
     people[name] = {
       status: parseStatus(row['Status']),
@@ -152,9 +178,8 @@ const LAM_ADVANCE_TIERS = [
 // LAM advance program is effective only for contracts signed ON OR AFTER
 // this date. Contracts signed before this generate no advance and (if
 // later cancelled) no retraction either — there was nothing to pay back.
-// RULE CHANGE: update the LAM canonical Drive doc to v2.1 with the
-// program-start-date language to match. Per Anshul, May 2026.
-const LAM_ADVANCE_START_DATE = '2026-09-01';
+// Per Anshul: the actual program start was September 2025.
+const LAM_ADVANCE_START_DATE = '2025-09-01';
 
 // LAM v2: tier rates applied to AGP (not GP)
 const LAM_FINAL_TIERS = [
@@ -281,7 +306,7 @@ function tierFor(amount, tiers) {
 // with a specific date is ever needed again, add a Separation Date
 // column to the People tab and reintroduce date math here.
 function checkSeparationOnly(personName, dealDate) {
-  const p = PEOPLE[personName];
+  const p = lookupPerson(personName);
   if (!p) {
     return {
       eligible: false,
@@ -388,7 +413,7 @@ function calcLAMAdvances(contractedDeals, period) {
         });
         continue;
       }
-      const p = PEOPLE[owner];
+      const p = lookupPerson(owner);
       if (!p || p.status === 'Inactive') {
         const reason = !p
           ? `${owner} not in People tab — treated as inactive, not chasing former employees.`
@@ -413,11 +438,37 @@ function calcLAMAdvances(contractedDeals, period) {
 }
 
 // LAM Final — reads Monthly Comm Outreach / Sales.
-// Tier on AGP, advance recomputed from current spread, deducted, floored at $0.
-function calcLAMFinals(salesDeals, period) {
+//   - Tier rate applied to AGP (max 0 — negative AGP floors to $0)
+//   - Advance is deducted ONLY when the contract was signed on/after
+//     LAM_ADVANCE_START_DATE. For pre-program contracts no advance was
+//     ever paid, so there's nothing to net out.
+//   - Floored at $0 on negative-AGP closes (LAM v2 §5).
+//
+// Signed date is read directly from the "AB Contract Signed Date" column
+// on Outreach Sales (added per Anshul). If the column is blank/missing
+// on a row, fall back to looking up the same deal in Contracted Deals.
+// If still no match, default to "no advance deducted" — safer to slightly
+// overpay than to claw back money the LAM was never actually advanced.
+function calcLAMFinals(salesDeals, contractedDeals, period) {
   const entries = [];
+  const cutoff = parseDate(LAM_ADVANCE_START_DATE);
+
+  // Fallback index: deal-ID → signed-date from Contracted Deals
+  const signedByDealId = {};
+  for (const c of (contractedDeals || [])) {
+    const id = (c['Contract Name'] || c.Contract_Name
+              || c['Deal Settlement'] || c.Deal_Settlement
+              || c.Deal_ID || c['Deal ID'] || '').toString().trim();
+    if (!id) continue;
+    const signed = c['Signed Contract Received Date']
+                || c.Signed_Contract_Received_Date
+                || c.Contract_Signed_Date;
+    const signedParsed = parseDate(signed);
+    if (signedParsed) signedByDealId[id] = signedParsed;
+  }
+
   for (const d of salesDeals) {
-    const dealId = d['Deal Settlement'] || d.Deal_Settlement || d.Deal_ID || '?';
+    const dealId = (d['Deal Settlement'] || d.Deal_Settlement || d.Deal_ID || '?').toString().trim();
     const lam = (d.LAM || d['LAM'] || '').trim();
     const closeDate = d['BC Close Date'] || d.BC_Close_Date || d.Closed_Funded_Date;
     if (!inPeriod(closeDate, period)) continue;
@@ -455,13 +506,33 @@ function calcLAMFinals(salesDeals, period) {
       continue;
     }
     const gross = tier.rate * agp;
-    const advTier = tierFor(spread, LAM_ADVANCE_TIERS);
-    const origAdvance = advTier ? advTier.advance : 0;
+
+    // Pick up signed date — preferred source first, then fallback.
+    const signedDateRaw = d['AB Contract Signed Date']
+                       || d.AB_Contract_Signed_Date
+                       || d['Contract Signed Date']
+                       || d.Contract_Signed_Date;
+    const signedDate = parseDate(signedDateRaw) || signedByDealId[dealId] || null;
+    const advanceWasPaid = signedDate && cutoff && signedDate >= cutoff;
+
+    let origAdvance = 0;
+    if (advanceWasPaid) {
+      const advTier = tierFor(spread, LAM_ADVANCE_TIERS);
+      origAdvance = advTier ? advTier.advance : 0;
+    }
     const net = gross - origAdvance;
 
-    const calcNote = agpRaw < 0
-      ? `Negative AGP ${fmtUSD(agpRaw)} floored to $0; advance ${fmtUSD(origAdvance)} kept (deal closed). Net: ${fmtUSD(net)}`
-      : `${fmtPct(tier.rate)} × ${fmtUSD(agp)} AGP = ${fmtUSD(gross)}; minus advance ${fmtUSD(origAdvance)} (spread ${fmtUSD(spread)}) = ${fmtUSD(net)}`;
+    let calcNote;
+    if (agpRaw < 0) {
+      calcNote = `Negative AGP ${fmtUSD(agpRaw)} floored to $0; advance ${fmtUSD(origAdvance)} kept (deal closed). Net: ${fmtUSD(net)}`;
+    } else if (advanceWasPaid) {
+      calcNote = `${fmtPct(tier.rate)} × ${fmtUSD(agp)} AGP = ${fmtUSD(gross)}; minus advance ${fmtUSD(origAdvance)} (spread ${fmtUSD(spread)}, contract signed ${ymKey(signedDate)}) = ${fmtUSD(net)}`;
+    } else {
+      const reason = signedDate
+        ? `contract signed ${ymKey(signedDate)} — before advance program (${LAM_ADVANCE_START_DATE})`
+        : 'no AB Contract Signed Date on row and no match in Contracted Deals — assuming no advance';
+      calcNote = `${fmtPct(tier.rate)} × ${fmtUSD(agp)} AGP = ${fmtUSD(gross)} (no advance deducted: ${reason})`;
+    }
 
     const finalAmount = (agpRaw < 0 && net < 0) ? 0 : net;
     const flooredNote = (agpRaw < 0 && net < 0)
@@ -876,7 +947,7 @@ function calcLIMManagerOverride(allEntries) {
   for (const [reportName, reportInfo] of Object.entries(PEOPLE)) {
     if (!reportInfo.manager || !managerByName[reportInfo.manager]) continue;
     const reportTotal = allEntries
-      .filter(e => e.person === reportName
+      .filter(e => normalizeName(e.person) === reportName
         && (e.role === 'LIA' || e.role === 'LIM')
         && e.flag === 'OK'
         && !/Closing/i.test(e.type))
@@ -949,7 +1020,7 @@ function runCommissions(period, data) {
 
   const all = [];
   all.push(...calcLAMAdvances(contracted, period));
-  all.push(...calcLAMFinals(outreachSales, period));
+  all.push(...calcLAMFinals(outreachSales, contracted, period));
   all.push(...calcLTC(outreachSales, period));
   all.push(...calcLPA(outreachSales, period));
   all.push(...calcLLP(outreachSales, period));
@@ -1008,35 +1079,46 @@ function renderResults(entries, period) {
   for (const e of entries) {
     if (e.flag === 'INELIGIBLE') continue;
     if (!e.person || e.person === '—') continue;
-    if (!byPerson[e.person]) byPerson[e.person] = { total: 0, count: 0, hasReview: false };
+    if (!byPerson[e.person]) byPerson[e.person] = { total: 0, count: 0, hasReview: false, byType: {} };
     byPerson[e.person].total += e.amount;
     byPerson[e.person].count += 1;
     if (e.flag === 'REVIEW') byPerson[e.person].hasReview = true;
+    const t = e.type || '(unknown)';
+    byPerson[e.person].byType[t] = (byPerson[e.person].byType[t] || 0) + e.amount;
   }
-  const sortedPeople = Object.entries(byPerson).sort((a, b) => b[1].total - a[1].total);
+  // Alphabetical sort so payroll review reads top-down by name, not by
+  // amount. Locale-aware so accented characters sort sensibly.
+  const sortedPeople = Object.entries(byPerson).sort((a, b) => a[0].localeCompare(b[0]));
   const grandTotal = sortedPeople.reduce((s, [, v]) => s + v.total, 0);
 
   let html = `<div class="period-banner">Period: <strong>${escapeHTML(fmtPeriodName(period))}</strong> &nbsp;·&nbsp; Grand Total: <strong>${fmtUSD(grandTotal)}</strong></div>`;
 
-  // Summary table — Person · Review · Lines · Total. Role column dropped
-  // (people wear multiple hats). Review column shows 🚩 if any of the
-  // person's lines are REVIEW.
+  // Summary table — Person · Review · Breakdown · Total.
+  // Breakdown shows per-type subtotals (e.g., "LAM Advance $50, LAM Final $565.80")
+  // so payroll review can see at a glance what makes up someone's total
+  // without expanding the drill-down.
   html += '<div class="people-list">';
   html += '<div class="people-header">';
   html += '<span>Person</span>';
   html += '<span class="flag-col" title="Manual review needed">⚑</span>';
-  html += '<span class="num">Lines</span>';
+  html += '<span>Breakdown</span>';
   html += '<span class="num">Total</span>';
   html += '</div>';
 
   for (const [person, v] of sortedPeople) {
     const personEntries = entries.filter(e => e.person === person && e.flag !== 'INELIGIBLE');
     if (personEntries.length === 0) continue;
+    // Build the breakdown string from per-type subtotals. Sort by absolute
+    // amount descending so the biggest line items come first.
+    const breakdownParts = Object.entries(v.byType)
+      .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+      .map(([type, amount]) => `${type} ${fmtUSD(amount)}`);
+    const breakdownStr = breakdownParts.join(', ');
     html += `<details class="person-row${v.hasReview ? ' has-review' : ''}">`;
     html += `<summary>`;
     html += `<span class="name">${escapeHTML(person)}</span>`;
     html += `<span class="flag-col">${v.hasReview ? '🚩' : ''}</span>`;
-    html += `<span class="num">${v.count}</span>`;
+    html += `<span class="breakdown-col">${escapeHTML(breakdownStr)}</span>`;
     html += `<span class="num">${fmtUSD(v.total)}</span>`;
     html += `</summary>`;
 
@@ -1045,19 +1127,55 @@ function renderResults(entries, period) {
     // a single row.
     html += '<div class="person-row-body">';
     html += '<table class="detail-table"><thead><tr>';
-    html += '<th class="flag-cell"></th><th>Type</th><th class="num">Lines</th><th class="num">Total</th><th>Summary</th>';
+    html += '<th>Type</th><th class="num">Lines</th><th class="num">Total</th><th>Summary</th>';
     html += '</tr></thead><tbody>';
     for (const g of groupByType(personEntries)) {
       const flagClass = g.hasReview ? 'flag-review' : 'flag-ok';
       html += `<tr class="${flagClass}">`;
-      html += `<td class="flag-cell">${g.hasReview ? '🚩' : ''}</td>`;
       html += `<td>${escapeHTML(g.type)}</td>`;
       html += `<td class="num">${g.count}</td>`;
       html += `<td class="num">${fmtUSD(g.total)}</td>`;
       html += `<td class="summary-cell">${escapeHTML(describeGroup(g))}</td>`;
       html += `</tr>`;
     }
-    html += '</tbody></table></div></details>';
+    html += '</tbody></table>';
+
+    // Per-person manual review list — appears under the calc table so
+    // each person's flags are right next to their payout.
+    // Grouped by (type, note) so duplicate notes (e.g., LPA's QoC
+    // verification reminder repeated across N lines) collapse into one line.
+    const reviewItems = personEntries.filter(e => e.flag === 'REVIEW');
+    if (reviewItems.length > 0) {
+      const reviewGroups = {};
+      for (const e of reviewItems) {
+        const message = e.notes || e.calc || '';
+        const key = `${e.type}||${message}`;
+        if (!reviewGroups[key]) {
+          reviewGroups[key] = { type: e.type, message, count: 0, sources: [] };
+        }
+        reviewGroups[key].count += 1;
+        if (reviewGroups[key].sources.length < 5) reviewGroups[key].sources.push(e.source);
+      }
+      const groups = Object.values(reviewGroups);
+      const totalReview = reviewItems.length;
+      html += `<div class="person-review-list">`;
+      html += `<div class="person-review-h">🚩 Manual Review Needed (${totalReview})</div>`;
+      html += `<ul>`;
+      for (const g of groups) {
+        let sources;
+        if (g.count === 1) {
+          sources = g.sources[0] ? ` <span class="src">(${escapeHTML(g.sources[0])})</span>` : '';
+        } else {
+          const shown = g.sources.join(', ');
+          const more = g.count > g.sources.length ? `, +${g.count - g.sources.length} more` : '';
+          sources = ` <span class="src">(${g.count} lines: ${escapeHTML(shown + more)})</span>`;
+        }
+        html += `<li><strong>${escapeHTML(g.type)}</strong>${sources}: ${escapeHTML(g.message)}</li>`;
+      }
+      html += `</ul></div>`;
+    }
+
+    html += '</div></details>';
   }
 
   html += `<div class="people-total"><span><strong>TOTAL</strong></span><span></span><span></span><span class="num"><strong>${fmtUSD(grandTotal)}</strong></span></div>`;
@@ -1066,18 +1184,10 @@ function renderResults(entries, period) {
   summaryEl.innerHTML = html;
   if (detailEl) detailEl.innerHTML = '';  // legacy container, now empty
 
-  // Flags panel — exclude '—' entries (data hygiene issues) per user request.
-  // Keep named-person REVIEW (e.g., LPA QoC verify) and all INELIGIBLE.
-  const reviewEntries = entries.filter(e => e.flag === 'REVIEW' && e.person !== '—' && e.person);
+  // Bottom flags panel — INELIGIBLE only. REVIEW items now live inline
+  // under each person's drill-down (right next to their payout).
   const ineligibleEntries = entries.filter(e => e.flag === 'INELIGIBLE');
   let flagsHTML = '';
-  if (reviewEntries.length > 0) {
-    flagsHTML += `<h3 class="flag-h">🚩 Manual Review Needed (${reviewEntries.length})</h3><ul>`;
-    for (const e of reviewEntries) {
-      flagsHTML += `<li><strong>${escapeHTML(e.person)} / ${escapeHTML(e.type)}</strong> — ${escapeHTML(e.source)}: ${escapeHTML(e.notes || e.calc)}</li>`;
-    }
-    flagsHTML += '</ul>';
-  }
   if (ineligibleEntries.length > 0) {
     flagsHTML += `<h3 class="flag-h">— Ineligible (${ineligibleEntries.length})</h3><ul>`;
     for (const e of ineligibleEntries) {
@@ -1085,7 +1195,7 @@ function renderResults(entries, period) {
     }
     flagsHTML += '</ul>';
   }
-  if (!flagsHTML) flagsHTML = '<p class="empty">No flags. Everything calculated cleanly.</p>';
+  if (!flagsHTML) flagsHTML = '<p class="empty">No ineligibles. Manual-review items (if any) are shown under each person above.</p>';
   flagsEl.innerHTML = flagsHTML;
 
   document.getElementById('results').classList.remove('hidden');
