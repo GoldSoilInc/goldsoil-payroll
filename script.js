@@ -781,10 +781,40 @@ function calcLIALIMClosing(salesDeals, period) {
 
     const bonus = LEAD_BONUSES[cat];
     if (!bonus) {
+      // Legacy fallback (Anshul, May 2026): pre-categorization deals
+      // and any unrecognized value default to paying the Sourcer the
+      // full pool. The rules currently define only Phone Fully Q,
+      // Phone Semi Q, and Text Fully Q (plus LaLa/Fantasy as $0
+      // intentional excludes — those go through the LEAD_BONUSES path
+      // below, not here). Treating blanks/unknowns as Text Fully Q
+      // -equivalent (sourcer gets everything) is the closest match to
+      // "who brought in this lead" for legacy uncategorized deals.
+      if (!sourcer) {
+        // No sourcer to fall back to — nothing payable. Flag so it
+        // gets attention if the category gets backfilled later.
+        entries.push({
+          person: '—', role: 'LIA/LIM Closing', period, source: dealId,
+          type: 'LIA/LIM Closing', amount: 0, calc: '—',
+          notes: `AILeadCategory "${cat || '(blank)'}" not in defined rules AND no Sourcer (Acq) — legacy fallback cannot apply. Backfill category or sourcer.`,
+          flag: 'REVIEW',
+        });
+        continue;
+      }
+      const elig = checkSeparationOnly(sourcer, closeDate);
+      if (!elig.eligible) {
+        entries.push({
+          person: sourcer, role: 'LIA', period, source: dealId, type: 'LIA Closing',
+          amount: 0, calc: '—', notes: elig.reason, flag: elig.flag,
+        });
+        continue;
+      }
+      const catLabel = cat || '(blank)';
       entries.push({
-        person: sourcer || qualifier || '?', role: 'LIA/LIM Closing', period, source: dealId,
-        type: 'LIA/LIM Closing', amount: 0, calc: '—',
-        notes: `Unknown AILeadCategory: "${cat}"`, flag: 'REVIEW',
+        person: sourcer, role: 'LIA', period, source: dealId, type: 'LIA Closing',
+        amount: pool,
+        calc: `Legacy fallback: AILeadCategory "${catLabel}" not in {Phone Fully Q, Phone Semi Q, Text Fully Q} → full pool ${fmtUSD(pool)} to Sourcer`,
+        notes: `0.3% × AGP ${fmtUSD(agp)}${elig.flag === 'REVIEW' ? '; ' + elig.reason : ''}`,
+        flag: elig.flag,
       });
       continue;
     }
