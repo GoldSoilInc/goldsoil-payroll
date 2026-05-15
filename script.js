@@ -32,7 +32,7 @@
    0. CONFIG — fill these in before first deploy
    ------------------------------------------------------------ */
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwrvtRktEP1nylsf3WaRRbpN4NtIIjrlARINsn0DKGFoYa1ipqgJKybjOrnFVcVCLpzLA/exec';
-const APPS_SCRIPT_TOKEN = ' 9EMY8RYSE5WUISFY2ZOBADP9F2FIOCDL';  // must match TOKEN in apps-script.gs
+const APPS_SCRIPT_TOKEN = '9EMY8RYSE5WUISFY2ZOBADP9F2FIOCDL';  // must match TOKEN in apps-script.gs
 
 // Tab names — must match the Google Sheet exactly
 const TAB_OUTREACH_SALES = 'Monthly Comm Outreach / Sales';
