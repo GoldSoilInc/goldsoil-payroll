@@ -237,7 +237,18 @@ function parseDate(s) {
   if (!s) return null;
   if (s instanceof Date) return s;
   const trimmed = String(s).trim();
-  if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return new Date(trimmed);
+  if (!trimmed) return null;
+  // Date-only YYYY-MM-DD: parse as LOCAL time. JavaScript's `new Date("2026-04-01")`
+  // interprets a bare date as UTC midnight, which in timezones west of UTC rolls
+  // back to the previous day. That silently dropped first-of-month entries like
+  // SC-066142 (signed 2026-04-01) out of the April period. Bare date strings
+  // should mean "this day in the user's locale", not "midnight UTC".
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const [y, m, d] = trimmed.split('-').map(n => parseInt(n, 10));
+    return new Date(y, m - 1, d);
+  }
+  // ISO with time component (e.g. "2026-04-01T05:00:00.000Z") — JS parses correctly.
+  if (/^\d{4}-\d{2}-\d{2}T/.test(trimmed)) return new Date(trimmed);
   if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(trimmed)) {
     const [m, d, y] = trimmed.split('/').map(n => parseInt(n, 10));
     return new Date(y, m - 1, d);
