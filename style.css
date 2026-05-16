@@ -73,12 +73,6 @@ header {
 
 .brand-text h1 .dot { color: var(--accent); margin: 0 0.25rem; }
 
-.subtitle {
-  margin: 0.25rem 0 0;
-  color: var(--ink-soft);
-  font-size: 0.95rem;
-}
-
 /* ---------- MAIN ---------- */
 main {
   max-width: var(--content-max);
@@ -272,16 +266,6 @@ main {
   text-decoration-color: rgba(0, 0, 0, 0.2);
 }
 
-.section-h {
-  font-family: var(--serif);
-  font-weight: 500;
-  font-size: 1.4rem;
-  margin: 2.5rem 0 1.25rem;
-  color: var(--ink);
-  padding-bottom: 0.5rem;
-  border-bottom: 1px solid var(--line);
-}
-
 /* ---------- PEOPLE LIST (summary + expandable detail combined) ---------- */
 .people-list {
   background: white;
@@ -290,14 +274,16 @@ main {
   overflow: hidden;
 }
 
-/* Shared grid template for header, each person row's summary, and the total row.
-   Columns: Name (flex) | Review flag | Lines | Total
-   (Role column removed — people wear multiple hats.) */
+/* Shared grid template for header, each person row's summary, the
+   dept subtotal, and the grand total. Columns:
+     Person (flex) | Breakdown | Total
+   (Flag column removed in dashboard v2.) */
 .people-header,
 .person-row > summary,
+.dept-subtotal,
 .people-total {
   display: grid;
-  grid-template-columns: minmax(8rem, 1.1fr) 3rem minmax(0, 2.2fr) 8rem;
+  grid-template-columns: minmax(8rem, 1.1fr) minmax(0, 2.2fr) 8rem;
   align-items: center;
   gap: 1rem;
   padding: 0.7rem 1rem;
@@ -316,10 +302,62 @@ main {
 
 .people-header .num,
 .person-row > summary .num,
+.dept-subtotal .num,
 .people-total .num {
   text-align: right;
   font-family: var(--mono);
   font-size: 0.92rem;
+}
+
+/* ---------- DEPARTMENT SECTIONS ---------- */
+.dept-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 0.85rem 1rem 0.6rem;
+  background: var(--bg-alt);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line-soft);
+  font-family: var(--serif);
+}
+
+.people-list > .dept-header:first-of-type {
+  border-top: none;
+}
+
+.dept-name {
+  font-weight: 600;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+}
+
+.dept-count {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--ink-muted);
+  letter-spacing: 0.02em;
+}
+
+.dept-subtotal {
+  background: var(--bg);
+  border-top: 1px solid var(--line-soft);
+  font-family: var(--serif);
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+  padding-top: 0.65rem;
+  padding-bottom: 0.65rem;
+}
+
+.dept-subtotal-label {
+  font-style: italic;
+}
+
+.dept-subtotal .num {
+  font-style: normal;
+  color: var(--ink);
+  font-weight: 500;
 }
 
 .person-row {
@@ -378,17 +416,6 @@ main {
   background: var(--bg);
 }
 
-/* Review flag column (summary table) */
-.flag-col {
-  text-align: center;
-  font-size: 1rem;
-  line-height: 1;
-}
-.people-header .flag-col {
-  color: var(--ink-muted);
-  opacity: 0.5;
-}
-
 /* Breakdown column — per-type subtotals shown in the summary row.
    Slightly smaller font + soft color so it reads as supporting info,
    not the headline number. */
@@ -399,7 +426,7 @@ main {
   line-height: 1.4;
   overflow-wrap: anywhere;
 }
-.people-header > span:nth-child(3) {
+.people-header > span:nth-child(2) {
   font-family: var(--serif);
   font-size: 0.85rem;
   text-transform: uppercase;
@@ -470,29 +497,6 @@ main {
 
 .people-total .num { color: var(--accent-soft); }
 
-/* ---------- FLAGS PANEL ---------- */
-.flags {
-  background: white;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 1.25rem 1.5rem;
-}
-
-.flags h3 {
-  margin: 0.5rem 0 0.75rem;
-  font-family: var(--serif);
-  font-size: 1rem;
-  font-weight: 500;
-  color: var(--accent);
-}
-
-.flags h3:first-child { margin-top: 0; }
-
-.flags ul { margin: 0 0 1rem; padding-left: 1.25rem; }
-.flags li { margin-bottom: 0.5rem; font-size: 0.92rem; line-height: 1.45; }
-.flags li strong { font-family: var(--serif); color: var(--ink); }
-.flags .empty { margin: 0; color: var(--ink-muted); font-style: italic; }
-
 /* ---------- FOOTER ---------- */
 footer {
   border-top: 1px solid var(--line);
@@ -522,16 +526,18 @@ footer code {
   .secondary-btn { width: 100%; }
   .people-header,
   .person-row > summary,
+  .dept-subtotal,
   .people-total {
-    grid-template-columns: 1fr 2.5rem 7rem;
+    grid-template-columns: 1fr 7rem;
     padding: 0.55rem 0.7rem;
     gap: 0.5rem;
   }
   /* Hide the Breakdown column on narrow screens — it's too long to fit
      gracefully. Expand a row to see the same info in the drill-down. */
-  .people-header > span:nth-child(3),
+  .people-header > span:nth-child(2),
   .person-row > summary > .breakdown-col,
-  .people-total > span:nth-child(3) { display: none; }
+  .dept-subtotal > span:nth-child(2),
+  .people-total > span:nth-child(2) { display: none; }
   .detail-table th, .detail-table td { padding: 0.4rem 0.55rem; font-size: 0.78rem; }
   .detail-table .summary-cell { font-size: 0.72rem; }
   .brand-mark { font-size: 2rem; }
