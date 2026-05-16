@@ -40,10 +40,30 @@
     <section id="results" class="results hidden">
       <div class="actions">
         <button id="copy-tsv-btn" class="secondary-btn">📋 Copy per-person totals (paste into Sheet)</button>
+        <button id="send-emails-btn" class="secondary-btn">✉ Send commission emails</button>
       </div>
 
       <div id="summary" class="summary"></div>
     </section>
+
+    <!-- Email confirmation modal — shown when Lucia clicks "Send commission emails".
+         Hidden by default; openSendEmailsModal() in script.js populates the body
+         with a recipient table + sample email preview, then removes .hidden. -->
+    <div id="email-modal" class="modal hidden" aria-hidden="true">
+      <div class="modal-dialog" role="dialog" aria-labelledby="email-modal-title">
+        <header class="modal-header">
+          <h2 id="email-modal-title">Send Commission Emails</h2>
+        </header>
+        <div class="modal-body" id="email-modal-body"></div>
+        <footer class="modal-footer">
+          <p id="email-modal-status" class="hint"></p>
+          <div class="modal-actions">
+            <button id="email-cancel-btn" class="secondary-btn">Cancel</button>
+            <button id="email-confirm-btn" class="primary-btn modal-confirm">Send emails</button>
+          </div>
+        </footer>
+      </div>
+    </div>
 
   </main>
 
