@@ -123,6 +123,7 @@ function buildPeopleFromSheet(peopleRows) {
       status: parseStatus(row['Status']),
       manager: parseManager(row['Manager']),
       isOutreachManager: parseOutreachMgr(row['Is Outreach Manager'] || row['Outreach Manager']),
+      department: normalizeName(row['Department'] || '') || null,
     };
   }
   return people;
@@ -1109,13 +1110,12 @@ async function fetchSheetData() {
    ------------------------------------------------------------ */
 function renderResults(entries, period) {
   const summaryEl = document.getElementById('summary');
-  const detailEl  = document.getElementById('detail');
-  const flagsEl   = document.getElementById('flags');
 
   // Aggregate by person. Skip:
-  //   - INELIGIBLE entries (handled by the Flags panel)
-  //   - Unattributed entries (person === '—'); these are SF data hygiene
-  //     issues, not real payouts, and shouldn't clutter the table.
+  //   - INELIGIBLE entries (no real payout; not surfaced anywhere now
+  //     that the Flags section has been removed)
+  //   - Unattributed entries (person === '—'); SF data hygiene issues,
+  //     not real payouts, and shouldn't clutter the table.
   const byPerson = {};
   for (const e of entries) {
     if (e.flag === 'INELIGIBLE') continue;
@@ -1127,161 +1127,181 @@ function renderResults(entries, period) {
     const t = e.type || '(unknown)';
     byPerson[e.person].byType[t] = (byPerson[e.person].byType[t] || 0) + e.amount;
   }
-  // Alphabetical sort so payroll review reads top-down by name, not by
-  // amount. Locale-aware so accented characters sort sensibly.
-  const sortedPeople = Object.entries(byPerson).sort((a, b) => a[0].localeCompare(b[0]));
-  const grandTotal = sortedPeople.reduce((s, [, v]) => s + v.total, 0);
 
+  // Group people by Department (column on the People tab). People who
+  // earned commission but aren't in the roster, or are in the roster but
+  // have a blank Department cell, fall into "(Unassigned)". That bucket
+  // sorts last so it reads as an exception, not a real department.
+  const byDepartment = {};
+  for (const [person, info] of Object.entries(byPerson)) {
+    const p = lookupPerson(person);
+    const dept = (p && p.department) ? p.department : '(Unassigned)';
+    if (!byDepartment[dept]) byDepartment[dept] = [];
+    byDepartment[dept].push([person, info]);
+  }
+  const deptNames = Object.keys(byDepartment).sort((a, b) => {
+    if (a === '(Unassigned)') return 1;
+    if (b === '(Unassigned)') return -1;
+    return a.localeCompare(b);
+  });
+  for (const dept of deptNames) {
+    byDepartment[dept].sort((a, b) => a[0].localeCompare(b[0]));
+  }
+
+  const grandTotal = Object.values(byPerson).reduce((s, v) => s + v.total, 0);
+
+  // Top grand-total banner (request #4: Grand Total at top).
   let html = `<div class="period-banner">Period: <strong>${escapeHTML(fmtPeriodName(period))}</strong> &nbsp;·&nbsp; Grand Total: <strong>${fmtUSD(grandTotal)}</strong></div>`;
 
-  // Summary table — Person · Review · Breakdown · Total.
-  // Breakdown shows per-type subtotals (e.g., "LAM Advance $50, LAM Final $565.80")
-  // so payroll review can see at a glance what makes up someone's total
-  // without expanding the drill-down.
+  // Summary table — Person · Breakdown · Total.
+  // (Flag column removed per request #5.)
+  // Breakdown shows per-type subtotals so payroll review can see at a
+  // glance what makes up someone's total without expanding the drill-down.
   html += '<div class="people-list">';
   html += '<div class="people-header">';
   html += '<span>Person</span>';
-  html += '<span class="flag-col" title="Manual review needed">⚑</span>';
   html += '<span>Breakdown</span>';
   html += '<span class="num">Total</span>';
   html += '</div>';
 
-  for (const [person, v] of sortedPeople) {
-    const personEntries = entries.filter(e => e.person === person && e.flag !== 'INELIGIBLE');
-    if (personEntries.length === 0) continue;
-    // Build the breakdown string from per-type subtotals. Sort by absolute
-    // amount descending so the biggest line items come first.
-    const breakdownParts = Object.entries(v.byType)
-      .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
-      .map(([type, amount]) => `${type} ${fmtUSD(amount)}`);
-    const breakdownStr = breakdownParts.join(', ');
-    html += `<details class="person-row${v.hasReview ? ' has-review' : ''}">`;
-    html += `<summary>`;
-    html += `<span class="name">${escapeHTML(person)}</span>`;
-    html += `<span class="flag-col">${v.hasReview ? '🚩' : ''}</span>`;
-    html += `<span class="breakdown-col">${escapeHTML(breakdownStr)}</span>`;
-    html += `<span class="num">${fmtUSD(v.total)}</span>`;
-    html += `</summary>`;
+  // Render one section per department, with a subtotal row at the end
+  // of each section.
+  for (const dept of deptNames) {
+    const peopleInDept = byDepartment[dept];
+    const deptTotal = peopleInDept.reduce((s, [, v]) => s + v.total, 0);
+    const headCount = peopleInDept.length;
 
-    // Drill-down: per-deal rows for everything coming from Contracted Deals,
-    // Sales, and Monthly Comm Outreach Sales. For Approved Leads (Per-Lead
-    // bonuses) we still aggregate by type — a LIM can have 50+ approved leads
-    // in a month and listing them individually is noise.
-    const perLeadByType = {};
-    const individualEntries = [];
-    for (const e of personEntries) {
-      if (/^Per-Lead/.test(e.type)) {
-        if (!perLeadByType[e.type]) perLeadByType[e.type] = [];
-        perLeadByType[e.type].push(e);
-      } else {
-        individualEntries.push(e);
-      }
-    }
-    // Sort individual rows by type, then source, so all LAM Advances cluster
-    // together, all LIA Closings cluster together, etc.
-    individualEntries.sort((a, b) =>
-      a.type.localeCompare(b.type) || String(a.source || '').localeCompare(String(b.source || ''))
-    );
-    const perLeadTypes = Object.keys(perLeadByType).sort();
+    html += `<div class="dept-header">`;
+    html += `<span class="dept-name">${escapeHTML(dept)}</span>`;
+    html += `<span class="dept-count">${headCount} ${headCount === 1 ? 'person' : 'people'}</span>`;
+    html += `</div>`;
 
-    html += '<div class="person-row-body">';
-    html += '<table class="detail-table"><thead><tr>';
-    html += '<th>Type</th><th>Source</th><th class="num">Amount</th><th>Calculation</th>';
-    html += '</tr></thead><tbody>';
+    for (const [person, v] of peopleInDept) {
+      const personEntries = entries.filter(e => e.person === person && e.flag !== 'INELIGIBLE');
+      if (personEntries.length === 0) continue;
 
-    // Individual rows — one per deal/contract/listing.
-    for (const e of individualEntries) {
-      const flagClass = e.flag === 'REVIEW' ? 'flag-review' : 'flag-ok';
-      html += `<tr class="${flagClass}">`;
-      html += `<td>${escapeHTML(e.type)}</td>`;
-      html += `<td class="src-cell">${escapeHTML(e.source)}</td>`;
-      html += `<td class="num">${fmtUSD(e.amount)}</td>`;
-      html += `<td class="summary-cell">${escapeHTML(e.calc)}</td>`;
-      html += `</tr>`;
-    }
+      // Per-type breakdown for the summary row. Sort by absolute amount
+      // descending so the biggest line items come first.
+      const breakdownParts = Object.entries(v.byType)
+        .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+        .map(([type, amount]) => `${type} ${fmtUSD(amount)}`);
+      const breakdownStr = breakdownParts.join(', ');
 
-    // Aggregated Per-Lead rows — one per category (Phone Fully Q, etc.).
-    for (const type of perLeadTypes) {
-      const ents = perLeadByType[type];
-      const total = ents.reduce((s, e) => s + e.amount, 0);
-      const count = ents.length;
-      const hasReview = ents.some(e => e.flag === 'REVIEW');
-      const flagClass = hasReview ? 'flag-review' : 'flag-ok';
-      const amounts = [...new Set(ents.map(e => e.amount))];
-      let calc;
-      if (amounts.length === 1) {
-        calc = `${count} approved lead${count === 1 ? '' : 's'} × ${fmtUSD(amounts[0])} = ${fmtUSD(total)}`;
-      } else {
-        calc = `${count} approved leads, varying amounts = ${fmtUSD(total)}`;
-      }
-      html += `<tr class="${flagClass}">`;
-      html += `<td>${escapeHTML(type)}</td>`;
-      html += `<td class="src-cell">${count} lead${count === 1 ? '' : 's'}</td>`;
-      html += `<td class="num">${fmtUSD(total)}</td>`;
-      html += `<td class="summary-cell">${escapeHTML(calc)}</td>`;
-      html += `</tr>`;
-    }
+      html += `<details class="person-row${v.hasReview ? ' has-review' : ''}">`;
+      html += `<summary>`;
+      html += `<span class="name">${escapeHTML(person)}</span>`;
+      html += `<span class="breakdown-col">${escapeHTML(breakdownStr)}</span>`;
+      html += `<span class="num">${fmtUSD(v.total)}</span>`;
+      html += `</summary>`;
 
-    html += '</tbody></table>';
-
-    // Per-person manual review list — appears under the calc table so
-    // each person's flags are right next to their payout.
-    // Grouped by (type, note) so duplicate notes (e.g., LPA's QoC
-    // verification reminder repeated across N lines) collapse into one line.
-    const reviewItems = personEntries.filter(e => e.flag === 'REVIEW');
-    if (reviewItems.length > 0) {
-      const reviewGroups = {};
-      for (const e of reviewItems) {
-        const message = e.notes || e.calc || '';
-        const key = `${e.type}||${message}`;
-        if (!reviewGroups[key]) {
-          reviewGroups[key] = { type: e.type, message, count: 0, sources: [] };
-        }
-        reviewGroups[key].count += 1;
-        if (reviewGroups[key].sources.length < 5) reviewGroups[key].sources.push(e.source);
-      }
-      const groups = Object.values(reviewGroups);
-      const totalReview = reviewItems.length;
-      html += `<div class="person-review-list">`;
-      html += `<div class="person-review-h">🚩 Manual Review Needed (${totalReview})</div>`;
-      html += `<ul>`;
-      for (const g of groups) {
-        let sources;
-        if (g.count === 1) {
-          sources = g.sources[0] ? ` <span class="src">(${escapeHTML(g.sources[0])})</span>` : '';
+      // Drill-down: per-deal rows for everything from Contracted Deals,
+      // Sales, and Monthly Comm Outreach Sales. For Approved Leads
+      // (Per-Lead bonuses) we still aggregate by type — a LIM can have
+      // 50+ approved leads in a month and listing them individually is noise.
+      const perLeadByType = {};
+      const individualEntries = [];
+      for (const e of personEntries) {
+        if (/^Per-Lead/.test(e.type)) {
+          if (!perLeadByType[e.type]) perLeadByType[e.type] = [];
+          perLeadByType[e.type].push(e);
         } else {
-          const shown = g.sources.join(', ');
-          const more = g.count > g.sources.length ? `, +${g.count - g.sources.length} more` : '';
-          sources = ` <span class="src">(${g.count} lines: ${escapeHTML(shown + more)})</span>`;
+          individualEntries.push(e);
         }
-        html += `<li><strong>${escapeHTML(g.type)}</strong>${sources}: ${escapeHTML(g.message)}</li>`;
       }
-      html += `</ul></div>`;
+      individualEntries.sort((a, b) =>
+        a.type.localeCompare(b.type) || String(a.source || '').localeCompare(String(b.source || ''))
+      );
+      const perLeadTypes = Object.keys(perLeadByType).sort();
+
+      html += '<div class="person-row-body">';
+      html += '<table class="detail-table"><thead><tr>';
+      html += '<th>Type</th><th>Source</th><th class="num">Amount</th><th>Calculation</th>';
+      html += '</tr></thead><tbody>';
+
+      for (const e of individualEntries) {
+        const flagClass = e.flag === 'REVIEW' ? 'flag-review' : 'flag-ok';
+        html += `<tr class="${flagClass}">`;
+        html += `<td>${escapeHTML(e.type)}</td>`;
+        html += `<td class="src-cell">${escapeHTML(e.source)}</td>`;
+        html += `<td class="num">${fmtUSD(e.amount)}</td>`;
+        html += `<td class="summary-cell">${escapeHTML(e.calc)}</td>`;
+        html += `</tr>`;
+      }
+
+      for (const type of perLeadTypes) {
+        const ents = perLeadByType[type];
+        const total = ents.reduce((s, e) => s + e.amount, 0);
+        const count = ents.length;
+        const hasReview = ents.some(e => e.flag === 'REVIEW');
+        const flagClass = hasReview ? 'flag-review' : 'flag-ok';
+        const amounts = [...new Set(ents.map(e => e.amount))];
+        let calc;
+        if (amounts.length === 1) {
+          calc = `${count} approved lead${count === 1 ? '' : 's'} × ${fmtUSD(amounts[0])} = ${fmtUSD(total)}`;
+        } else {
+          calc = `${count} approved leads, varying amounts = ${fmtUSD(total)}`;
+        }
+        html += `<tr class="${flagClass}">`;
+        html += `<td>${escapeHTML(type)}</td>`;
+        html += `<td class="src-cell">${count} lead${count === 1 ? '' : 's'}</td>`;
+        html += `<td class="num">${fmtUSD(total)}</td>`;
+        html += `<td class="summary-cell">${escapeHTML(calc)}</td>`;
+        html += `</tr>`;
+      }
+
+      html += '</tbody></table>';
+
+      // Per-person manual review list — appears under the calc table so
+      // each person's review items are right next to their payout.
+      // Grouped by (type, note) so duplicate notes (e.g., LPA's QoC
+      // verification reminder repeated across N lines) collapse into one line.
+      const reviewItems = personEntries.filter(e => e.flag === 'REVIEW');
+      if (reviewItems.length > 0) {
+        const reviewGroups = {};
+        for (const e of reviewItems) {
+          const message = e.notes || e.calc || '';
+          const key = `${e.type}||${message}`;
+          if (!reviewGroups[key]) {
+            reviewGroups[key] = { type: e.type, message, count: 0, sources: [] };
+          }
+          reviewGroups[key].count += 1;
+          if (reviewGroups[key].sources.length < 5) reviewGroups[key].sources.push(e.source);
+        }
+        const groups = Object.values(reviewGroups);
+        const totalReview = reviewItems.length;
+        html += `<div class="person-review-list">`;
+        html += `<div class="person-review-h">Manual Review Needed (${totalReview})</div>`;
+        html += `<ul>`;
+        for (const g of groups) {
+          let sources;
+          if (g.count === 1) {
+            sources = g.sources[0] ? ` <span class="src">(${escapeHTML(g.sources[0])})</span>` : '';
+          } else {
+            const shown = g.sources.join(', ');
+            const more = g.count > g.sources.length ? `, +${g.count - g.sources.length} more` : '';
+            sources = ` <span class="src">(${g.count} lines: ${escapeHTML(shown + more)})</span>`;
+          }
+          html += `<li><strong>${escapeHTML(g.type)}</strong>${sources}: ${escapeHTML(g.message)}</li>`;
+        }
+        html += `</ul></div>`;
+      }
+
+      html += '</div></details>';
     }
 
-    html += '</div></details>';
+    // Department subtotal row.
+    html += `<div class="dept-subtotal">`;
+    html += `<span class="dept-subtotal-label">Subtotal — ${escapeHTML(dept)}</span>`;
+    html += `<span></span>`;
+    html += `<span class="num">${fmtUSD(deptTotal)}</span>`;
+    html += `</div>`;
   }
 
-  html += `<div class="people-total"><span><strong>TOTAL</strong></span><span></span><span></span><span class="num"><strong>${fmtUSD(grandTotal)}</strong></span></div>`;
+  // Bottom grand-total row (request #4: Grand Total at bottom).
+  html += `<div class="people-total"><span><strong>GRAND TOTAL</strong></span><span></span><span class="num"><strong>${fmtUSD(grandTotal)}</strong></span></div>`;
   html += '</div>';  // close .people-list
 
   summaryEl.innerHTML = html;
-  if (detailEl) detailEl.innerHTML = '';  // legacy container, now empty
-
-  // Bottom flags panel — INELIGIBLE only. REVIEW items now live inline
-  // under each person's drill-down (right next to their payout).
-  const ineligibleEntries = entries.filter(e => e.flag === 'INELIGIBLE');
-  let flagsHTML = '';
-  if (ineligibleEntries.length > 0) {
-    flagsHTML += `<h3 class="flag-h">— Ineligible (${ineligibleEntries.length})</h3><ul>`;
-    for (const e of ineligibleEntries) {
-      flagsHTML += `<li><strong>${escapeHTML(e.person)} / ${escapeHTML(e.type)}</strong> — ${escapeHTML(e.source)}: ${escapeHTML(e.notes)}</li>`;
-    }
-    flagsHTML += '</ul>';
-  }
-  if (!flagsHTML) flagsHTML = '<p class="empty">No ineligibles. Manual-review items (if any) are shown under each person above.</p>';
-  flagsEl.innerHTML = flagsHTML;
-
   document.getElementById('results').classList.remove('hidden');
 }
 
@@ -1293,34 +1313,26 @@ function escapeHTML(s) {
 }
 
 /* ------------------------------------------------------------
-   9. EXPORTS
+   9. EXPORT — per-person totals (paste into the Pay Periods sheet)
+   ----------------------------------------------------------------
+   Replaced the old line-by-line CSV/TSV with a simple per-person
+   summary: one row per person with their final total. Matches how
+   Lucia actually uses the output in payroll.
    ------------------------------------------------------------ */
-function entriesToTable(entries) {
-  const headers = ['Person', 'Role', 'Period', 'Source', 'Type', 'Amount', 'Calculation', 'Notes', 'Flag'];
-  const rows = entries.map(e => [
-    e.person, e.role, e.period || '', e.source, e.type,
-    e.amount.toFixed(2), e.calc, e.notes, e.flag,
-  ]);
-  return [headers, ...rows];
-}
-
-function downloadCSV(entries, period) {
-  const table = entriesToTable(entries);
-  const csv = table.map(row => row.map(cell => {
-    const s = String(cell ?? '');
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  }).join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `commissions_${period}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
 function copyTSV(entries) {
-  const table = entriesToTable(entries);
+  // Aggregate by person, mirroring the renderResults aggregation:
+  // skip INELIGIBLE entries and unattributed ('—') entries.
+  const byPerson = {};
+  for (const e of entries) {
+    if (e.flag === 'INELIGIBLE') continue;
+    if (!e.person || e.person === '—') continue;
+    byPerson[e.person] = (byPerson[e.person] || 0) + e.amount;
+  }
+
+  const sortedPeople = Object.entries(byPerson).sort((a, b) => a[0].localeCompare(b[0]));
+  const headers = ['Person', 'Total'];
+  const table = [headers, ...sortedPeople.map(([person, total]) => [person, total.toFixed(2)])];
+
   const tsv = table.map(row => row.join('\t')).join('\n');
   navigator.clipboard.writeText(tsv).then(() => {
     const btn = document.getElementById('copy-tsv-btn');
@@ -1373,8 +1385,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  document.getElementById('download-csv-btn').addEventListener('click', () =>
-    downloadCSV(lastEntries, lastPeriod));
   document.getElementById('copy-tsv-btn').addEventListener('click', () =>
     copyTSV(lastEntries));
 });
