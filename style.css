@@ -410,9 +410,9 @@ main {
   font-weight: 500;
 }
 
-/* ---------- ROLE SUB-HEADERS (Operations only) ----------
-   Used to group people inside the Operations department by their
-   Role (Director, Manager, etc.). Visually subordinate to the
+/* ---------- ROLE SUB-HEADERS ----------
+   Used inside every department to group people by their Role
+   (e.g., LAM, LIM, LPM, Director). Visually subordinate to the
    department header — smaller, no accent color, thin top border —
    so the hierarchy reads Department > Role > Person. */
 .role-header {
