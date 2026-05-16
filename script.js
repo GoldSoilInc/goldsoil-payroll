@@ -1351,38 +1351,34 @@ function renderResults(entries, period) {
     html += `<span class="dept-count">${headCount} ${headCount === 1 ? 'person' : 'people'}</span>`;
     html += `</div>`;
 
-    if (dept.toLowerCase() === 'operations') {
-      // Sub-group by Role inside Operations only. Other departments
-      // are flat lists of people — Anshul asked specifically for
-      // Operations to be broken out further.
-      const byRole = {};
-      for (const [person, info] of peopleInDept) {
-        const p = lookupPerson(person);
-        const role = (p && p.role) ? p.role : '(No Role)';
-        if (!byRole[role]) byRole[role] = [];
-        byRole[role].push([person, info]);
-      }
-      const roleNames = Object.keys(byRole).sort((a, b) => {
-        if (a === '(No Role)') return 1;
-        if (b === '(No Role)') return -1;
-        return a.localeCompare(b);
-      });
-      for (const role of roleNames) {
-        byRole[role].sort((a, b) => a[0].localeCompare(b[0]));
-      }
-      for (const role of roleNames) {
-        const peopleInRole = byRole[role];
-        const roleCount = peopleInRole.length;
-        html += `<div class="role-header">`;
-        html += `<span class="role-name">${escapeHTML(role)}</span>`;
-        html += `<span class="role-count">${roleCount} ${roleCount === 1 ? 'person' : 'people'}</span>`;
-        html += `</div>`;
-        for (const [person, v] of peopleInRole) {
-          html += renderOne(person, v);
-        }
-      }
-    } else {
-      for (const [person, v] of peopleInDept) {
+    // Sub-group people inside this department by their Role. Applied
+    // to every department, not just Operations, so the visual hierarchy
+    // (Department → Role → Person) is consistent across the dashboard.
+    // People with no Role on the People tab bucket under "(No Role)",
+    // which sorts last.
+    const byRole = {};
+    for (const [person, info] of peopleInDept) {
+      const p = lookupPerson(person);
+      const role = (p && p.role) ? p.role : '(No Role)';
+      if (!byRole[role]) byRole[role] = [];
+      byRole[role].push([person, info]);
+    }
+    const roleNames = Object.keys(byRole).sort((a, b) => {
+      if (a === '(No Role)') return 1;
+      if (b === '(No Role)') return -1;
+      return a.localeCompare(b);
+    });
+    for (const role of roleNames) {
+      byRole[role].sort((a, b) => a[0].localeCompare(b[0]));
+    }
+    for (const role of roleNames) {
+      const peopleInRole = byRole[role];
+      const roleCount = peopleInRole.length;
+      html += `<div class="role-header">`;
+      html += `<span class="role-name">${escapeHTML(role)}</span>`;
+      html += `<span class="role-count">${roleCount} ${roleCount === 1 ? 'person' : 'people'}</span>`;
+      html += `</div>`;
+      for (const [person, v] of peopleInRole) {
         html += renderOne(person, v);
       }
     }
