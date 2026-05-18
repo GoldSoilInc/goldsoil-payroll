@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GoldSoil — Payroll Calculator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <span class="brand-mark">◈</span>
+      <div class="brand-text">
+        <h1>GoldSoil <span class="dot">·</span> Payroll Calculator</h1>
+      </div>
+    </div>
+  </header>
+
+  <main>
+
+    <section class="inputs">
+      <div class="period-block">
+        <div class="period-label">Pay Period</div>
+        <div class="period-value" id="period-display">—</div>
+        <p class="hint">Auto-set to the previous full month. Sheet data is fetched directly — no upload needed.</p>
+      </div>
+
+      <button id="calc-btn" class="primary-btn">
+        <span class="btn-label">Calculate Commissions</span>
+        <span class="btn-spinner" aria-hidden="true"></span>
+      </button>
+
+      <p class="hint center" id="status-line">Click to fetch the latest sheet data and run the calc.</p>
+    </section>
+
+    <section id="results" class="results hidden">
+      <!-- CSV download controls. The Payment Mode toggle filters which
+           roster members appear in the file (matching their Payment Mode
+           column on the People tab). Download Commission CSV produces a
+           Contract Name + Amount file for the active filter. Download
+           Payroll CSV is disabled — placeholder for a future feature. -->
+      <div class="actions">
+        <div class="csv-controls">
+          <span class="filter-label">Payment Mode:</span>
+          <div class="payment-mode-toggle" role="group" aria-label="Payment Mode filter">
+            <button class="payment-toggle-btn active" data-mode="Deel">Deel</button>
+            <button class="payment-toggle-btn" data-mode="OnPay">OnPay</button>
+          </div>
+          <button id="download-csv-btn" class="secondary-btn">⬇ Download Commission CSV</button>
+          <button id="download-payroll-btn" class="secondary-btn" disabled
+                  title="Payroll download — coming soon">⬇ Download Payroll CSV</button>
+        </div>
+        <button id="send-emails-btn" class="secondary-btn">✉ Send commission emails</button>
+      </div>
+      <p id="csv-download-status" class="csv-status"></p>
+
+      <div id="summary" class="summary"></div>
+
+      <!-- Type Legend — static reference for every Type value that can
+           appear in the dashboard (breakdown column, drill-down detail
+           tables, emails). Collapsed by default; click to expand. Pure
+           HTML — no script.js logic depends on this block.
+
+           When commission rules change, update BOTH the canonical Drive
+           doc AND this legend's wording so they stay in sync. The rate
+           values shown here are illustrative summaries — the canonical
+           doc remains source of truth. -->
+      <details class="type-legend">
+        <summary>Type Legend — what each commission type means</summary>
+        <div class="type-legend-body">
+
+          <div class="type-legend-group">
+            <h4>Acquisitions (LAM)</h4>
+            <dl>
+              <dt>LAM Advance</dt>
+              <dd>$50–$250 fixed payment at contract signing, tiered by Deal Spread. Only paid on contracts signed on/after Sep 2025.</dd>
+
+              <dt>LAM Retraction</dt>
+              <dd>Clawback of the advance when a contract is cancelled. Skipped if the LAM has separated (not chasing former employees).</dd>
+
+              <dt>LAM Final</dt>
+              <dd>Tiered rate (6%–10%) × Adj Gross Profit at close, minus any advance already paid. Floored at $0 on negative-AGP deals (no advance clawback).</dd>
+            </dl>
+          </div>
+
+          <div class="type-legend-group">
+            <h4>Closing (LTC)</h4>
+            <dl>
+              <dt>LTC Closing Bonus</dt>
+              <dd>Flat $50 per closed-and-funded deal. Currently all attributed to Pracy Ann Pryce (sole active LTC).</dd>
+            </dl>
+          </div>
+
+          <div class="type-legend-group">
+            <h4>Comps Team (LPA / LLP)</h4>
+            <dl>
+              <dt>LPA</dt>
+              <dd>0.3% × Adj Gross Profit for the Property Analyst on each closed deal. Flagged REVIEW pending Quality of Comps ≥95% verification.</dd>
+
+              <dt>LLP</dt>
+              <dd>0.15% × Adj Gross Profit for the Lead Processor. Same QoC ≥95% gate caveat.</dd>
+            </dl>
+          </div>
+
+          <div class="type-legend-group">
+            <h4>Outreach — Component A (per-lead approval bonus)</h4>
+            <dl>
+              <dt>Per-Lead (Phone Fully Q)</dt>
+              <dd>Split: $1 to LIA (Sourcer) + $4 to LIM (Qualifier). Same person did both → $5.</dd>
+
+              <dt>Per-Lead (Phone Semi Q)</dt>
+              <dd>Split: $1 to LIA + $2 to LIM. Same person → $3.</dd>
+
+              <dt>Per-Lead (Text Fully Q)</dt>
+              <dd>$1 to the LIA (text-only qualification — no LIM phone step).</dd>
+
+              <dt>Per-Lead (… → blank-Q)</dt>
+              <dd>Phone Fully/Semi Q but Qualifier field is blank → falls back to $1 LIA only. LIM portion forfeited (v4 §4A.1).</dd>
+            </dl>
+          </div>
+
+          <div class="type-legend-group">
+            <h4>Outreach — Component B (closing share on funded deals)</h4>
+            <dl>
+              <dt>LIA Closing</dt>
+              <dd>Sourcer's share of a 0.3% × AGP pool, split using the same proportions as the per-lead bonus for that lead category.</dd>
+
+              <dt>LIM Closing</dt>
+              <dd>Qualifier's share of the same pool. Blank Sourcer or Qualifier → that share is forfeited, not redistributed.</dd>
+            </dl>
+          </div>
+
+          <div class="type-legend-group">
+            <h4>Sales (LPM)</h4>
+            <dl>
+              <dt>LPM Portfolio</dt>
+              <dd>Matrix rate (0.375%–1.5%) × Σ(AGP) across all the LPM's closed listings for the period. Rate is determined by portfolio Avg DOM × Portfolio PAR. Negative portfolio AGP → floored to $0.</dd>
+            </dl>
+          </div>
+
+          <div class="type-legend-group">
+            <h4>Management &amp; Executive</h4>
+            <dl>
+              <dt>Outreach Team Mgr Override</dt>
+              <dd>20% × sum of direct reports' Component A bonuses. Component B closing commissions are excluded from the override base.</dd>
+
+              <dt>NOI-Tiered Exec</dt>
+              <dd>Revenue-tier rate × monthly NOI. Currently applies to Art Oaing (DOA PH) and Leslie Bernolo (DOT) — both pending revision.</dd>
+            </dl>
+          </div>
+
+        </div>
+      </details>
+    </section>
+
+    <!-- Email confirmation modal — shown when Lucia clicks "Send commission emails".
+         Hidden by default; openSendEmailsModal() in script.js populates the body
+         with a recipient table + sample email preview, then removes .hidden. -->
+    <div id="email-modal" class="modal hidden" aria-hidden="true">
+      <div class="modal-dialog" role="dialog" aria-labelledby="email-modal-title">
+        <header class="modal-header">
+          <h2 id="email-modal-title">Send Commission Emails</h2>
+        </header>
+        <div class="modal-body" id="email-modal-body"></div>
+        <footer class="modal-footer">
+          <p id="email-modal-status" class="hint"></p>
+          <div class="modal-actions">
+            <button id="email-cancel-btn" class="secondary-btn">Cancel</button>
+            <button id="email-confirm-btn" class="primary-btn modal-confirm">Send emails</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+  </main>
+
+  <footer>
+    <p>Source: GitHub. Rules canonical in Drive: <code>/Commission Calculator/</code>. Sheet data fetched live from Google Sheets via Apps Script. No data leaves your browser after fetch.</p>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
