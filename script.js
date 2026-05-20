@@ -678,15 +678,60 @@ function calcLAMFinals(salesDeals, contractedDeals, period) {
     const gross = tier.rate * agp;
 
     // Resolve signed date AND contract name (for LAM Advance tab lookup).
-    // Prefer values on the Sales row; fall back to Contracted Deals index.
+    //
+    // Signed date: prefer the row's own column; fall back to Contracted
+    // Deals index by Deal Settlement.
+    //
+    // Contract name (LAM Advance lookup key): read directly from the
+    // "Seller Transaction: Transaction Name" column, which formats as
+    // TR-SC-XXXXXX. Strip the "TR-" prefix to get the SC-XXXXXX key.
+    // Per Anshul (May 2026), this column is never blank — if it is, or
+    // if the value isn't in TR-SC-XXXXXX form, we flag REVIEW instead
+    // of guessing. The old Contract-Name / Contracted-Deals fallback
+    // is no longer used here.
     const signedDateRaw = d['AB Contract Signed Date']
                        || d.AB_Contract_Signed_Date
                        || d['Contract Signed Date']
                        || d.Contract_Signed_Date;
     const fallbackMeta = contractMetaByDealId[dealId] || null;
     const signedDate = parseDate(signedDateRaw) || (fallbackMeta && fallbackMeta.signedDate) || null;
-    const rowContractName = (d['Contract Name'] || d.Contract_Name || '').toString().trim();
-    const contractName = rowContractName || (fallbackMeta && fallbackMeta.contractName) || dealId;
+
+    const txnNameRaw = (d['Seller Transaction: Transaction Name']
+                     || d.Seller_Transaction_Transaction_Name
+                     || '').toString().trim();
+    // Strip a leading "TR-" (case-insensitive) to derive the SC-XXXXXX
+    // key. If the value doesn't carry the prefix but already looks like
+    // SC-XXXXXX, accept it as-is — bare values aren't strictly per spec
+    // but they're recoverable; total garbage falls through to REVIEW.
+    let contractName = null;
+    let txnNameError = null;
+    if (!txnNameRaw) {
+      txnNameError = `"Seller Transaction: Transaction Name" is blank on this row — required for LAM Advance lookup. Expected format: TR-SC-XXXXXX.`;
+    } else {
+      const m = txnNameRaw.match(/^\s*(?:TR-)?(SC-\S+)\s*$/i);
+      if (m) {
+        // Preserve the SC- portion's original casing rather than uppercasing
+        // — the LAM Advance tab keys are also user-entered, so a case-sensitive
+        // exact match is the safest comparison. (normalizeName inside the
+        // resolver handles whitespace.)
+        contractName = m[1];
+      } else {
+        txnNameError = `"Seller Transaction: Transaction Name" = "${txnNameRaw}" doesn't match expected format TR-SC-XXXXXX — cannot derive LAM Advance lookup key.`;
+      }
+    }
+
+    // If the new column failed (blank or malformed), flag REVIEW and skip
+    // the advance math entirely — we won't pay a LAM Final without knowing
+    // what advance to deduct.
+    if (txnNameError) {
+      entries.push({
+        person: lam, role: 'LAM', period, source: dealId, type: 'LAM Final',
+        amount: 0,
+        calc: `${fmtPct(tier.rate)} × ${fmtUSD(agp)} AGP = ${fmtUSD(gross)}, but advance amount could not be resolved.`,
+        notes: txnNameError, flag: 'REVIEW',
+      });
+      continue;
+    }
 
     // Resolve the advance to deduct. Three paths inside the helper:
     //   pre-program → $0; historical-tab → LAM Advance lookup; tier-table → current tiers.
