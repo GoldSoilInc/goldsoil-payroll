@@ -47,6 +47,7 @@ const TAB_SALES          = 'Sales';
 const TAB_CONTRACTED     = 'Contracted Deals';
 const TAB_PEOPLE         = 'People';
 const TAB_FINANCE        = 'Finance';
+const TAB_LAM_ADVANCE    = 'LAM Advance';        // historical advances for Sept 2025–Mar 2026 signings
 const TAB_HISTORY        = 'Commission_History';  // optional — populated by writeCommissionHistory
 
 // Trends panel default window: how many recent months of history to
@@ -222,6 +223,38 @@ function buildFinanceFromSheet(rows) {
 }
 
 /* ------------------------------------------------------------
+   2b. LAM ADVANCE LOOKUP — populated from the "LAM Advance" tab
+   ----------------------------------------------------------------
+   Historical advances paid Sept 2025 – Mar 2026 under the old tier
+   schedule. Keyed by Contract Name. Used by both calcLAMAdvances
+   (retraction path) and calcLAMFinals (advance-deduction path) when
+   the contract was signed inside the historical window.
+
+   Sheet columns expected:
+     Signed Contract Received Date | Contract Name | Seller Name |
+     Transaction Name | LAM Advance Amount
+
+   Only Contract Name and LAM Advance Amount are read here — the
+   other columns are kept on the sheet for human reference.
+
+   If a contract from the historical window is NOT on this tab,
+   the calculator flags REVIEW rather than guessing — we'd rather
+   pause than pay/claw back the wrong amount.
+   ------------------------------------------------------------ */
+let LAM_ADVANCE_LOOKUP = {};
+
+function buildLAMAdvanceLookup(rows) {
+  const out = {};
+  for (const row of (rows || [])) {
+    const contractName = normalizeName(row['Contract Name'] || row['Contract'] || '');
+    if (!contractName) continue;
+    const amount = parseMoney(row['LAM Advance Amount'] || row['Advance Amount'] || row['Advance']);
+    out[contractName] = amount;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------
    3. COMMISSION RULE TABLES
    ------------------------------------------------------------ */
 const LAM_ADVANCE_TIERS = [
@@ -232,11 +265,29 @@ const LAM_ADVANCE_TIERS = [
   { min: 200000, max: Infinity, advance: 250 },
 ];
 
-// LAM advance program is effective only for contracts signed ON OR AFTER
-// this date. Contracts signed before this generate no advance and (if
-// later cancelled) no retraction either — there was nothing to pay back.
-// Per Anshul: the actual program start was September 2025.
-const LAM_ADVANCE_START_DATE = '2025-09-01';
+// LAM advance program has two distinct rule periods:
+//
+//   [1] Sept 1, 2025 – Mar 31, 2026 (HISTORICAL):
+//       Advances were paid under an earlier, different tier schedule.
+//       Actual paid amounts are kept on the "LAM Advance" sheet tab and
+//       looked up by Contract Name. This calculator does NOT generate new
+//       advance payments for this window (those were paid manually months
+//       ago) — but for any contract from this window that cancels OR
+//       closes now, we use the LAM Advance tab as the source of truth
+//       for the retraction amount and for the advance to net out of the
+//       LAM Final payout.
+//
+//   [2] Apr 1, 2026 onward (CURRENT):
+//       Advances use LAM_ADVANCE_TIERS below ($50–$250 by Deal Spread).
+//       This is the only window where the calculator generates new
+//       advance entries; retractions and finals for these contracts
+//       also use the tier table.
+//
+// Contracts signed BEFORE Sept 1, 2025 received no advance under either
+// rule, so they generate no retraction and have no advance to deduct
+// from the final.
+const LAM_ADVANCE_START_DATE     = '2025-09-01';  // first day any advance was paid (historical window starts)
+const LAM_ADVANCE_NEW_RULE_DATE  = '2026-04-01';  // first day current tier schedule applies
 
 // LAM v2: tier rates applied to AGP (not GP)
 const LAM_FINAL_TIERS = [
@@ -408,9 +459,53 @@ function isNonPerson(v) {
 
 // LAM Advance + Retraction — reads Contracted Deals (rollover).
 // Program effective for contracts signed on/after LAM_ADVANCE_START_DATE.
+// Resolve the advance amount for a single contract, given its signed date,
+// Contract Name, and Deal Spread. Returns:
+//   { amount, source, error }
+// where source ∈ {'historical-tab', 'tier-table', 'pre-program'} and error
+// is non-null only when the historical-window contract is missing from the
+// LAM Advance tab (caller should flag REVIEW in that case).
+//
+// This is the single source of truth for "how much was this LAM's advance"
+// used by both the retraction path and the LAM Final advance-deduction path.
+function resolveLAMAdvanceForContract(signedDateParsed, contractName, spread) {
+  const historicalStart = parseDate(LAM_ADVANCE_START_DATE);     // 2025-09-01
+  const newRuleStart    = parseDate(LAM_ADVANCE_NEW_RULE_DATE);  // 2026-04-01
+
+  if (!signedDateParsed || signedDateParsed < historicalStart) {
+    return { amount: 0, source: 'pre-program', error: null };
+  }
+
+  if (signedDateParsed < newRuleStart) {
+    // Sept 2025 – Mar 2026 historical window: look up actual paid amount
+    // from the LAM Advance tab. Missing = REVIEW, don't guess.
+    const key = normalizeName(contractName);
+    if (key && Object.prototype.hasOwnProperty.call(LAM_ADVANCE_LOOKUP, key)) {
+      return { amount: LAM_ADVANCE_LOOKUP[key], source: 'historical-tab', error: null };
+    }
+    return {
+      amount: 0,
+      source: 'historical-tab',
+      error: `Contract signed ${ymKey(signedDateParsed)} (historical advance window) but "${contractName}" not found on LAM Advance tab. Add the row with the actual advance paid, then re-run.`,
+    };
+  }
+
+  // Apr 2026+: current tier schedule.
+  const tier = tierFor(spread, LAM_ADVANCE_TIERS);
+  if (!tier) {
+    return {
+      amount: 0,
+      source: 'tier-table',
+      error: `Spread ${fmtUSD(spread)} outside tier table`,
+    };
+  }
+  return { amount: tier.advance, source: 'tier-table', error: null };
+}
+
 function calcLAMAdvances(contractedDeals, period) {
   const entries = [];
-  const cutoff = parseDate(LAM_ADVANCE_START_DATE);
+  const historicalStart = parseDate(LAM_ADVANCE_START_DATE);
+  const newRuleStart    = parseDate(LAM_ADVANCE_NEW_RULE_DATE);
   for (const d of contractedDeals) {
     const contractId = d['Contract Name'] || d.Contract_Name || d.Deal_ID || '?';
     const owner = (d['Closer (Acq)'] || d.Closer_Acq || d.LAM_Owner || d.LAM || '').trim();
@@ -419,14 +514,22 @@ function calcLAMAdvances(contractedDeals, period) {
     const signedDate = d['Signed Contract Received Date'] || d.Signed_Contract_Received_Date || d.Contract_Signed_Date;
     const cxDate = d['Date Cancelled'] || d.Date_Cancelled || d.Cancellation_Date;
 
-    // Program eligibility: contracts signed BEFORE the program start date
-    // generate neither an advance nor a retraction.
+    // Pre-program contracts (signed before Sept 2025) received no advance
+    // under any rule, so they generate neither an advance nor a retraction.
     const signedDateParsed = parseDate(signedDate);
-    const isCoveredByProgram = signedDateParsed && cutoff && signedDateParsed >= cutoff;
+    const isCoveredByProgram = signedDateParsed && historicalStart && signedDateParsed >= historicalStart;
     if (!isCoveredByProgram) continue;
 
-    // Advance path: signed in target month
-    if (inPeriod(signedDate, period)) {
+    // Whether this contract falls in the historical window (Sept 2025 – Mar 2026)
+    // or the new-rule window (Apr 2026+). Used by both paths below.
+    const isHistorical = signedDateParsed < newRuleStart;
+
+    // Advance path: signed in target month.
+    // The calculator only generates NEW advance entries for the current
+    // tier-rule window (Apr 2026+). Historical-window advances were paid
+    // manually back in 2025/early 2026 — we don't re-pay them here even
+    // if a historical signing happens to fall inside `period`.
+    if (inPeriod(signedDate, period) && !isHistorical) {
       if (isNonPerson(owner)) {
         entries.push({
           person: '—', role: 'LAM', period, source: contractId, type: 'LAM Advance',
@@ -461,7 +564,10 @@ function calcLAMAdvances(contractedDeals, period) {
       }
     }
 
-    // Retraction path: cancelled in target month, stage = Cancelled
+    // Retraction path: cancelled in target month, stage = Cancelled.
+    // Uses resolveLAMAdvanceForContract so historical-window cancellations
+    // claw back the actual paid amount from the LAM Advance tab, while
+    // new-rule cancellations claw back the tier-table amount.
     if (inPeriod(cxDate, period) && stage === 'Cancelled') {
       if (isNonPerson(owner)) {
         entries.push({
@@ -472,12 +578,23 @@ function calcLAMAdvances(contractedDeals, period) {
         });
         continue;
       }
-      const tier = tierFor(spread, LAM_ADVANCE_TIERS);
-      if (!tier) {
+      const resolved = resolveLAMAdvanceForContract(signedDateParsed, contractId, spread);
+      if (resolved.error) {
         entries.push({
           person: owner, role: 'LAM', period, source: contractId, type: 'LAM Retraction',
-          amount: 0, calc: `Spread ${fmtUSD(spread)} outside tiers`,
-          notes: 'Check Deal Spread', flag: 'REVIEW',
+          amount: 0, calc: '—',
+          notes: resolved.error, flag: 'REVIEW',
+        });
+        continue;
+      }
+      if (resolved.amount === 0) {
+        // Either a $0 entry was explicitly recorded on the LAM Advance tab,
+        // or (very rare) a tier returned $0. Either way, nothing to retract.
+        entries.push({
+          person: owner, role: 'LAM', period, source: contractId, type: 'LAM Retraction',
+          amount: 0, calc: '—',
+          notes: `No advance to retract (${resolved.source === 'historical-tab' ? 'LAM Advance tab shows $0' : 'tier table returned $0'}).`,
+          flag: 'OK',
         });
         continue;
       }
@@ -493,10 +610,13 @@ function calcLAMAdvances(contractedDeals, period) {
         continue;
       }
       const reason = (d['Transaction Termination Reason'] || d.Transaction_Termination_Reason || '').trim();
+      const calcNote = resolved.source === 'historical-tab'
+        ? `Cancelled (signed ${ymKey(signedDateParsed)}, historical window) → retract ${fmtUSD(resolved.amount)} from LAM Advance tab`
+        : `Cancelled (spread ${fmtUSD(spread)}) → retract advance ${fmtUSD(resolved.amount)}`;
       entries.push({
         person: owner, role: 'LAM', period, source: contractId, type: 'LAM Retraction',
-        amount: -tier.advance,
-        calc: `Cancelled (spread ${fmtUSD(spread)}) → retract advance ${fmtUSD(tier.advance)}`,
+        amount: -resolved.amount,
+        calc: calcNote,
         notes: reason ? `Cancellation reason: ${reason}` : '',
         flag: 'OK',
       });
@@ -507,9 +627,11 @@ function calcLAMAdvances(contractedDeals, period) {
 
 // LAM Final — reads Monthly Comm Outreach / Sales.
 //   - Tier rate applied to AGP (max 0 — negative AGP floors to $0)
-//   - Advance is deducted ONLY when the contract was signed on/after
-//     LAM_ADVANCE_START_DATE. For pre-program contracts no advance was
-//     ever paid, so there's nothing to net out.
+//   - Advance is deducted using `resolveLAMAdvanceForContract`:
+//       * Signed Sept 2025 – Mar 2026 → look up actual amount from
+//         the LAM Advance tab (historical schedule, different tiers)
+//       * Signed Apr 2026+ → use current LAM_ADVANCE_TIERS
+//       * Signed before Sept 2025 → no advance ever paid, deduct $0
 //   - Floored at $0 on negative-AGP closes (LAM v2 §5).
 //
 // Signed date is read directly from the "AB Contract Signed Date" column
@@ -519,20 +641,26 @@ function calcLAMAdvances(contractedDeals, period) {
 // overpay than to claw back money the LAM was never actually advanced.
 function calcLAMFinals(salesDeals, contractedDeals, period) {
   const entries = [];
-  const cutoff = parseDate(LAM_ADVANCE_START_DATE);
 
-  // Fallback index: deal-ID → signed-date from Contracted Deals
-  const signedByDealId = {};
+  // Fallback index: deal-ID → { signedDate, contractName } from Contracted Deals.
+  // The Sales tab uses Deal Settlement as its identifier; we index Contracted Deals
+  // by every plausible identifier so we can look up either the signed date or the
+  // Contract Name (needed for the LAM Advance tab lookup) when the Sales row
+  // doesn't carry them directly.
+  const contractMetaByDealId = {};
   for (const c of (contractedDeals || [])) {
-    const id = (c['Contract Name'] || c.Contract_Name
-              || c['Deal Settlement'] || c.Deal_Settlement
-              || c.Deal_ID || c['Deal ID'] || '').toString().trim();
-    if (!id) continue;
+    const contractName = (c['Contract Name'] || c.Contract_Name || '').toString().trim();
+    const dealSettlement = (c['Deal Settlement'] || c.Deal_Settlement || c.Deal_ID || c['Deal ID'] || '').toString().trim();
     const signed = c['Signed Contract Received Date']
                 || c.Signed_Contract_Received_Date
                 || c.Contract_Signed_Date;
     const signedParsed = parseDate(signed);
-    if (signedParsed) signedByDealId[id] = signedParsed;
+    const meta = { signedDate: signedParsed, contractName: contractName || null };
+    // Index under both keys so either lookup hits.
+    if (contractName) contractMetaByDealId[contractName] = meta;
+    if (dealSettlement && !contractMetaByDealId[dealSettlement]) {
+      contractMetaByDealId[dealSettlement] = meta;
+    }
   }
 
   for (const d of salesDeals) {
@@ -575,25 +703,94 @@ function calcLAMFinals(salesDeals, contractedDeals, period) {
     }
     const gross = tier.rate * agp;
 
-    // Pick up signed date — preferred source first, then fallback.
+    // Resolve signed date AND contract name (for LAM Advance tab lookup).
+    //
+    // Signed date: prefer the row's own column; fall back to Contracted
+    // Deals index by Deal Settlement.
+    //
+    // Contract name (LAM Advance lookup key): read directly from the
+    // "Seller Transaction: Transaction Name" column, which formats as
+    // TR-SC-XXXXXX. Strip the "TR-" prefix to get the SC-XXXXXX key.
+    // Per Anshul (May 2026), this column is never blank — if it is, or
+    // if the value isn't in TR-SC-XXXXXX form, we flag REVIEW instead
+    // of guessing. The old Contract-Name / Contracted-Deals fallback
+    // is no longer used here.
     const signedDateRaw = d['AB Contract Signed Date']
                        || d.AB_Contract_Signed_Date
                        || d['Contract Signed Date']
                        || d.Contract_Signed_Date;
-    const signedDate = parseDate(signedDateRaw) || signedByDealId[dealId] || null;
-    const advanceWasPaid = signedDate && cutoff && signedDate >= cutoff;
+    const fallbackMeta = contractMetaByDealId[dealId] || null;
+    const signedDate = parseDate(signedDateRaw) || (fallbackMeta && fallbackMeta.signedDate) || null;
 
-    let origAdvance = 0;
-    if (advanceWasPaid) {
-      const advTier = tierFor(spread, LAM_ADVANCE_TIERS);
-      origAdvance = advTier ? advTier.advance : 0;
+    const txnNameRaw = (d['Seller Transaction: Transaction Name']
+                     || d.Seller_Transaction_Transaction_Name
+                     || '').toString().trim();
+    // Strip a leading "TR-" (case-insensitive) to derive the SC-XXXXXX
+    // key. If the value doesn't carry the prefix but already looks like
+    // SC-XXXXXX, accept it as-is — bare values aren't strictly per spec
+    // but they're recoverable; total garbage falls through to REVIEW.
+    let contractName = null;
+    let txnNameError = null;
+    if (!txnNameRaw) {
+      txnNameError = `"Seller Transaction: Transaction Name" is blank on this row — required for LAM Advance lookup. Expected format: TR-SC-XXXXXX.`;
+    } else {
+      const m = txnNameRaw.match(/^\s*(?:TR-)?(SC-\S+)\s*$/i);
+      if (m) {
+        // Preserve the SC- portion's original casing rather than uppercasing
+        // — the LAM Advance tab keys are also user-entered, so a case-sensitive
+        // exact match is the safest comparison. (normalizeName inside the
+        // resolver handles whitespace.)
+        contractName = m[1];
+      } else {
+        txnNameError = `"Seller Transaction: Transaction Name" = "${txnNameRaw}" doesn't match expected format TR-SC-XXXXXX — cannot derive LAM Advance lookup key.`;
+      }
     }
+
+    // If the new column failed (blank or malformed), flag REVIEW and skip
+    // the advance math entirely — we won't pay a LAM Final without knowing
+    // what advance to deduct.
+    if (txnNameError) {
+      entries.push({
+        person: lam, role: 'LAM', period, source: dealId, type: 'LAM Final',
+        amount: 0,
+        calc: `${fmtPct(tier.rate)} × ${fmtUSD(agp)} AGP = ${fmtUSD(gross)}, but advance amount could not be resolved.`,
+        notes: txnNameError, flag: 'REVIEW',
+      });
+      continue;
+    }
+
+    // Resolve the advance to deduct. Three paths inside the helper:
+    //   pre-program → $0; historical-tab → LAM Advance lookup; tier-table → current tiers.
+    let origAdvance = 0;
+    let resolvedSource = 'pre-program';
+    let resolveError = null;
+    if (signedDate) {
+      const resolved = resolveLAMAdvanceForContract(signedDate, contractName, spread);
+      origAdvance = resolved.amount;
+      resolvedSource = resolved.source;
+      resolveError = resolved.error;
+    }
+
+    // If the historical-window lookup missed (contract not on LAM Advance tab),
+    // flag REVIEW and don't pay — better than over/underpaying by the wrong amount.
+    if (resolveError) {
+      entries.push({
+        person: lam, role: 'LAM', period, source: dealId, type: 'LAM Final',
+        amount: 0,
+        calc: `${fmtPct(tier.rate)} × ${fmtUSD(agp)} AGP = ${fmtUSD(gross)}, but advance amount could not be resolved.`,
+        notes: resolveError, flag: 'REVIEW',
+      });
+      continue;
+    }
+
     const net = gross - origAdvance;
 
     let calcNote;
     if (agpRaw < 0) {
       calcNote = `Negative AGP ${fmtUSD(agpRaw)} floored to $0; advance ${fmtUSD(origAdvance)} kept (deal closed). Net: ${fmtUSD(net)}`;
-    } else if (advanceWasPaid) {
+    } else if (resolvedSource === 'historical-tab') {
+      calcNote = `${fmtPct(tier.rate)} × ${fmtUSD(agp)} AGP = ${fmtUSD(gross)}; minus advance ${fmtUSD(origAdvance)} (contract signed ${ymKey(signedDate)}, historical window — from LAM Advance tab) = ${fmtUSD(net)}`;
+    } else if (resolvedSource === 'tier-table') {
       calcNote = `${fmtPct(tier.rate)} × ${fmtUSD(agp)} AGP = ${fmtUSD(gross)}; minus advance ${fmtUSD(origAdvance)} (spread ${fmtUSD(spread)}, contract signed ${ymKey(signedDate)}) = ${fmtUSD(net)}`;
     } else {
       const reason = signedDate
@@ -1143,7 +1340,7 @@ async function fetchSheetData() {
   const body = await res.json();
   if (body.error) throw new Error(`Apps Script: ${body.error}`);
   // Per-tab errors
-  for (const tab of [TAB_OUTREACH_SALES, TAB_APPROVED_LEADS, TAB_SALES, TAB_CONTRACTED, TAB_PEOPLE, TAB_FINANCE]) {
+  for (const tab of [TAB_OUTREACH_SALES, TAB_APPROVED_LEADS, TAB_SALES, TAB_CONTRACTED, TAB_PEOPLE, TAB_FINANCE, TAB_LAM_ADVANCE]) {
     const v = body[tab];
     if (v && v.error) throw new Error(`Tab "${tab}": ${v.error}`);
     if (!v) throw new Error(`Tab "${tab}" missing from response`);
@@ -1158,6 +1355,11 @@ async function fetchSheetData() {
   }
   // Hydrate FINANCE from the Finance tab. Empty is OK — calcNOITiered flags the gap.
   FINANCE = buildFinanceFromSheet(body[TAB_FINANCE]);
+  // Hydrate LAM_ADVANCE_LOOKUP from the LAM Advance tab. Empty is OK if no
+  // historical-window (Sept 2025 – Mar 2026) contracts are ever processed —
+  // but if one shows up in retraction/finals with no lookup match, those
+  // lines will flag REVIEW.
+  LAM_ADVANCE_LOOKUP = buildLAMAdvanceLookup(body[TAB_LAM_ADVANCE]);
   // Hydrate lastHistoryData from the optional Commission_History tab.
   // Absence is normal before the very first writeCommissionHistory
   // call ever runs — first Calculate after Step 3 deploys will create
