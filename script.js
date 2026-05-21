@@ -2023,17 +2023,17 @@ function renderEmailPreviewHTML(r, periodLabel) {
     }
   }
   return '<div style="font-family:sans-serif;color:#0F1B2D;line-height:1.55;font-size:14px;padding:1rem;background:white;border-radius:2px;">'
-    + '<p>Hi ' + firstName + ' 👋</p>'
-    + '<p>Hope you\'re doing well! 😊</p>'
-    + '<p>Great news — you\'ve earned <strong style="color:#2E5D3D;">' + fmtUSD(r.total) + '</strong> in commissions for <strong>' + escapeHTML(periodLabel) + '</strong>. 🎉 Here\'s your breakdown:</p>'
+    + '<p>Hi ' + firstName + ',</p>'
+    + '<p>Hope you\'re doing well.</p>'
+    + '<p>Great news — you\'ve earned <strong style="color:#2E5D3D;">' + fmtUSD(r.total) + '</strong> in commissions for <strong>' + escapeHTML(periodLabel) + '</strong>. Here\'s your breakdown:</p>'
     + '<table style="border-collapse:collapse;width:100%;margin-top:8px;">' + rows
     + '<tr>'
     + '<td colspan="2" style="font-weight:600;font-size:15px;padding:14px 0 0 0;border-top:2px solid #D7CFBF;">Total</td>'
     + '<td style="text-align:right;font-family:monospace;font-weight:600;font-size:15px;padding:14px 0 0 0;border-top:2px solid #D7CFBF;">' + fmtUSD(r.total) + '</td>'
     + '</tr>'
     + '</table>'
-    + '<p style="margin-top:24px;">Payment will be processed on the 20th of this month per the standard schedule. 💰</p>'
-    + '<p>Thank you for your ongoing commitment, consistency, and great work — your contribution is a key part of our success, and we\'re grateful to have you on the team! 🚀</p>'
+    + '<p style="margin-top:24px;">Payment will be processed on the 20th of this month per the standard schedule.</p>'
+    + '<p>Thank you for your ongoing commitment, consistency, and great work — your contribution is a key part of our success, and we\'re grateful to have you on the team.</p>'
     + '<p>If you have any questions about the calculation, please reply to this email — Anshul is CC\'d.</p>'
     + '<p style="color:#8A8E97;font-size:13px;margin-top:32px;">— GoldSoil HR</p>'
     + '</div>';
