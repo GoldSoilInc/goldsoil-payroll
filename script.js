@@ -2818,6 +2818,278 @@ function downloadPayrollReport(analysis, meta) {
   downloadFile(csv, `payroll_hours_flags_${stamp}.csv`, 'text/csv;charset=utf-8;');
 }
 
+/* ------------------------------------------------------------
+   11b. CUSTOM EXPORT (long format) — full three-control review
+   ------------------------------------------------------------
+   The Time Doctor Custom Export with "Daily breakdown per user" gives one
+   row per person per day, with Date, Time tracked, Paid/Unpaid Break time,
+   and Start/End times. That lets us run all of Lucia's controls in one pass:
+     • Hours  — weekday Time tracked over the daily limit (break INCLUDED,
+                per company rule: the 8h limit counts the paid break).
+     • Breaks — daily paid+unpaid break over the policy limit (30 min).
+     • Window — start before / end after the operational window (8–5 Central).
+     • Weekend — any Sat/Sun work.
+   ------------------------------------------------------------ */
+
+// Detect which Time Doctor export was uploaded. Custom Export (long) has a
+// per-row "Date" column AND a "Time tracked" column; the Hours Tracked
+// (wide) export instead has per-day "(Decimal)" columns and no "Date".
+function detectPayrollFormat(rows) {
+  const header = (rows[0] || []).map(h => (h || '').trim().toLowerCase());
+  if (header.includes('date') && header.includes('time tracked')) return 'custom';
+  return 'wide';
+}
+
+const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const DOW_NAMES = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+// Parse a Time Doctor "M/D/YY" date → { dayName, isWeekend, label, sort }.
+function parsePayrollDate(s) {
+  const m = String(s || '').trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!m) return null;
+  let [_, mo, da, yr] = m;
+  mo = parseInt(mo, 10); da = parseInt(da, 10); yr = parseInt(yr, 10);
+  if (yr < 100) yr += 2000;
+  const d = new Date(yr, mo - 1, da);
+  const dow = d.getDay();
+  return {
+    dayName: DOW_NAMES[dow],
+    isWeekend: dow === 0 || dow === 6,
+    label: `${MONTH_NAMES[mo - 1]} ${da}`,
+    sort: yr * 10000 + mo * 100 + da,
+  };
+}
+
+// "HH:MM" → minutes since midnight; blank/invalid → null.
+function parseClock(s) {
+  const m = String(s || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+// "07:34" passthrough for display (kept as-is from the export).
+function clockStr(s) { return String(s || '').trim(); }
+
+function analyzePayrollCustom(rows, opts) {
+  const header = rows[0];
+  const col = {};
+  header.forEach((h, i) => { col[(h || '').trim().toLowerCase()] = i; });
+  const need = ['name', 'date', 'time tracked'];
+  for (const n of need) if (!(n in col)) throw new Error(`Custom Export is missing the "${n}" column.`);
+
+  const get = (row, name) => { const i = col[name]; return i == null ? '' : row[i]; };
+  const num = (row, name) => parsePayrollHours(get(row, name));
+
+  const dailyLimit = opts.dailyLimit;
+  const hourThresh = dailyLimit + (opts.graceMin || 0) / 60;
+  const breakLimitMin = opts.breakLimitMin;
+  const breakThreshMin = breakLimitMin + (opts.breakGraceMin || 0);
+  const winStart = opts.winStartMin, winEnd = opts.winEndMin, winGrace = opts.winGraceMin || 0;
+  const flagWeekend = opts.flagWeekend;
+
+  // Group rows by person.
+  const byPerson = new Map();
+  let minSort = Infinity, maxSort = -Infinity, minLabel = '', maxLabel = '';
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const name = (get(row, 'name') || '').trim();
+    if (!name) continue;
+    const dt = parsePayrollDate(get(row, 'date'));
+    if (!dt) continue;
+    if (dt.sort < minSort) { minSort = dt.sort; minLabel = dt.label; }
+    if (dt.sort > maxSort) { maxSort = dt.sort; maxLabel = dt.label; }
+    if (!byPerson.has(name)) {
+      byPerson.set(name, { name, email: (get(row, 'email') || '').trim(),
+                           group: (get(row, 'user groups') || '').trim(), days: [] });
+    }
+    byPerson.get(name).days.push({
+      dt,
+      tt: num(row, 'time tracked'),
+      brkMin: (num(row, 'paid break time') + num(row, 'unpaid break time')) * 60,
+      start: get(row, 'start time'),
+      end: get(row, 'end time'),
+    });
+  }
+
+  const flagged = [], clean = [];
+  for (const p of byPerson.values()) {
+    const overDays = [], weekendDays = [], breakDays = [], windowDays = [];
+    let totalOverHrs = 0, worstDayHrs = 0, weekendHrs = 0, totalHrs = 0;
+
+    for (const d of p.days) {
+      if (d.tt <= 0) continue;       // not a worked day
+      totalHrs += d.tt;
+
+      if (d.dt.isWeekend) {
+        if (flagWeekend) { weekendDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt }); weekendHrs += d.tt; }
+        continue;                    // weekend is the headline flag; skip weekday checks
+      }
+
+      // Hours (break included per company rule)
+      if (d.tt > hourThresh) {
+        const excess = d.tt - dailyLimit;
+        overDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt, excessMin: excess * 60 });
+        totalOverHrs += excess;
+        if (d.tt > worstDayHrs) worstDayHrs = d.tt;
+      }
+
+      // Breaks
+      if (d.brkMin > breakThreshMin) {
+        breakDays.push({ label: d.dt.label, dayName: d.dt.dayName, brkMin: d.brkMin, overMin: d.brkMin - breakLimitMin });
+      }
+
+      // Operational window
+      const sMin = parseClock(d.start), eMin = parseClock(d.end);
+      const early = sMin != null && sMin < winStart - winGrace;
+      const late = eMin != null && eMin > winEnd + winGrace;
+      if (early || late) {
+        windowDays.push({ label: d.dt.label, dayName: d.dt.dayName, start: clockStr(d.start), end: clockStr(d.end), early, late });
+      }
+    }
+
+    const rec = { name: p.name, email: p.email, group: p.group, totalHrs,
+                  overDays, weekendDays, breakDays, windowDays,
+                  totalOverHrs, worstDayHrs, weekendHrs,
+                  flagCount: overDays.length + weekendDays.length + breakDays.length + windowDays.length };
+    if (rec.flagCount > 0) flagged.push(rec); else clean.push(rec);
+  }
+
+  flagged.sort((a, b) => (b.totalOverHrs + b.weekendHrs) - (a.totalOverHrs + a.weekendHrs) || b.flagCount - a.flagCount);
+  clean.sort((a, b) => b.totalHrs - a.totalHrs);
+
+  const dateRange = minLabel && maxLabel ? `${minLabel} – ${maxLabel}` : '';
+  return { format: 'custom', flagged, clean, dateRange };
+}
+
+// Render the three-control custom-export results.
+function renderPayrollCustom(analysis, meta) {
+  const wrap = document.getElementById('payroll-summary');
+  const resultsSection = document.getElementById('payroll-results');
+  const { flagged, clean } = analysis;
+  const total = flagged.length + clean.length;
+
+  const win = `${meta.winStartStr}–${meta.winEndStr}`;
+  let html = `<div class="period-banner">`
+           + `<span>Report: <strong>${escapeHTML(analysis.dateRange || meta.fileName)}</strong></span>`
+           + `<span>${meta.dailyLimit}h/day · break ${meta.breakLimitMin}m · window ${win} CT · ${flagged.length} of ${total} flagged</span>`
+           + `</div>`;
+
+  // Legend of the four flag types.
+  html += `<div class="payroll-flag-legend">`
+        + `<span class="pf pf-hours">H · over ${meta.dailyLimit}h</span>`
+        + `<span class="pf pf-break">B · break &gt; ${meta.breakLimitMin}m</span>`
+        + `<span class="pf pf-window">W · outside ${win}</span>`
+        + `<span class="pf pf-weekend">E · weekend</span>`
+        + `</div>`;
+
+  if (flagged.length === 0) {
+    html += `<div class="payroll-clean-banner">✓ No flags: everyone stayed within ${meta.dailyLimit}h, kept breaks under ${meta.breakLimitMin}m, worked inside ${win} CT, and logged no weekend time.</div>`;
+    wrap.innerHTML = html;
+    resultsSection.classList.remove('hidden');
+    return;
+  }
+
+  html += `<table class="detail-table payroll-table"><thead><tr>`
+        + `<th>Name</th><th>Flags</th>`
+        + `<th class="num">Total</th><th class="num">Days&gt;${meta.dailyLimit}h</th>`
+        + `<th class="num">Worst</th><th class="num">Break</th>`
+        + `<th class="num">Window</th><th class="num">Weekend</th>`
+        + `</tr></thead><tbody>`;
+
+  for (const p of flagged) {
+    const chips = [];
+    if (p.overDays.length) chips.push(`<span class="pf pf-hours">H${p.overDays.length}</span>`);
+    if (p.breakDays.length) chips.push(`<span class="pf pf-break">B${p.breakDays.length}</span>`);
+    if (p.windowDays.length) chips.push(`<span class="pf pf-window">W${p.windowDays.length}</span>`);
+    if (p.weekendDays.length) chips.push(`<span class="pf pf-weekend">E${p.weekendDays.length}</span>`);
+
+    // Detail sections
+    let detail = '';
+    if (p.overDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Over ${meta.dailyLimit}h (weekday)</div>`;
+      for (const d of p.overDays)
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">${fmtHrs(d.hrs)} <em>${fmtOverMin(d.excessMin)}</em></span></div>`;
+      detail += `</div>`;
+    }
+    if (p.breakDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Break over ${meta.breakLimitMin}m</div>`;
+      for (const d of p.breakDays)
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">${Math.round(d.brkMin)}m <em>+${Math.round(d.overMin)}m</em></span></div>`;
+      detail += `</div>`;
+    }
+    if (p.windowDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Outside ${win} CT</div>`;
+      for (const d of p.windowDays) {
+        const tags = [d.early ? 'early start' : '', d.late ? 'late end' : ''].filter(Boolean).join(', ');
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)} <em class="muted">${escapeHTML(tags)}</em></span><span class="mono">${escapeHTML(d.start)}–${escapeHTML(d.end)}</span></div>`;
+      }
+      detail += `</div>`;
+    }
+    if (p.weekendDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Weekend work</div>`;
+      for (const d of p.weekendDays)
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">${fmtHrs(d.hrs)}</span></div>`;
+      detail += `</div>`;
+    }
+
+    const groupTag = p.group ? `<span class="payroll-group-tag">${escapeHTML(p.group)}</span>` : '';
+    html += `<tr class="flag-review payroll-row">`
+          + `<td><details class="payroll-person"><summary><strong>${escapeHTML(p.name)}</strong>${groupTag}`
+          + `<span class="payroll-email">${escapeHTML(p.email)}</span></summary>`
+          + `<div class="payroll-detail">${detail}</div></details></td>`
+          + `<td>${chips.join(' ')}</td>`
+          + `<td class="num">${fmtHrs(p.totalHrs)}</td>`
+          + `<td class="num">${p.overDays.length || '—'}</td>`
+          + `<td class="num">${p.worstDayHrs ? fmtHrs(p.worstDayHrs) : '—'}</td>`
+          + `<td class="num">${p.breakDays.length || '—'}</td>`
+          + `<td class="num">${p.windowDays.length || '—'}</td>`
+          + `<td class="num">${p.weekendHrs ? fmtHrs(p.weekendHrs) : '—'}</td>`
+          + `</tr>`;
+  }
+  html += `</tbody></table>`;
+
+  if (clean.length) {
+    html += `<details class="payroll-clean"><summary>${clean.length} with no flags</summary>`
+          + `<div class="payroll-clean-list">`
+          + clean.map(p => `<span>${escapeHTML(p.name)} <em>${fmtHrs(p.totalHrs)}</em></span>`).join('')
+          + `</div></details>`;
+  }
+
+  wrap.innerHTML = html;
+  resultsSection.classList.remove('hidden');
+}
+
+function downloadPayrollCustomReport(analysis, meta) {
+  const win = `${meta.winStartStr}-${meta.winEndStr}`;
+  const lines = [['Name', 'Email', 'User group', 'Date', 'Day', 'Flag', 'Detail'].join(',')];
+  const push = (p, label, dayName, flag, detail) =>
+    lines.push([csvEscape(p.name), csvEscape(p.email), csvEscape(p.group), csvEscape(label), csvEscape(dayName), csvEscape(flag), csvEscape(detail)].join(','));
+  for (const p of analysis.flagged) {
+    for (const d of p.overDays) push(p, d.label, d.dayName, `Over ${meta.dailyLimit}h`, `${d.hrs.toFixed(2)}h (${fmtOverMin(d.excessMin)})`);
+    for (const d of p.breakDays) push(p, d.label, d.dayName, `Break over ${meta.breakLimitMin}m`, `${Math.round(d.brkMin)}m (+${Math.round(d.overMin)}m)`);
+    for (const d of p.windowDays) push(p, d.label, d.dayName, `Outside ${win} CT`, `${d.start}-${d.end}${d.early ? ' early' : ''}${d.late ? ' late' : ''}`);
+    for (const d of p.weekendDays) push(p, d.label, d.dayName, 'Weekend work', `${d.hrs.toFixed(2)}h`);
+  }
+  const csv = lines.join('\r\n');
+  const stamp = (analysis.dateRange || meta.fileName || 'report').replace(/[^A-Za-z0-9]+/g, '_');
+  downloadFile(csv, `payroll_flags_${stamp}.csv`, 'text/csv;charset=utf-8;');
+}
+
+// Format-aware dispatchers used by the UI handler.
+function runPayrollAnalysis(rows, meta) {
+  const fmt = detectPayrollFormat(rows);
+  if (fmt === 'custom') return analyzePayrollCustom(rows, meta);
+  return analyzePayroll(rows, meta);   // legacy wide Hours Tracked
+}
+function renderPayroll(analysis, meta) {
+  if (analysis.format === 'custom') return renderPayrollCustom(analysis, meta);
+  return renderPayrollResults(analysis, meta);
+}
+function downloadPayroll(analysis, meta) {
+  if (analysis.format === 'custom') return downloadPayrollCustomReport(analysis, meta);
+  return downloadPayrollReport(analysis, meta);
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const periodDisplay = document.getElementById('period-display');
   const calcBtn = document.getElementById('calc-btn');
@@ -3012,22 +3284,33 @@ document.addEventListener('DOMContentLoaded', () => {
       payrollStatus.className = 'hint center';
       payrollStatus.textContent = 'Analyzing…';
       try {
-        const dailyLimit = parseFloat(document.getElementById('payroll-limit').value) || 8;
-        const graceMin = parseFloat(document.getElementById('payroll-grace').value) || 0;
-        const flagWeekend = document.getElementById('payroll-flag-weekend').checked;
+        const val = (id, def) => { const el = document.getElementById(id); const v = parseFloat(el && el.value); return Number.isFinite(v) ? v : def; };
+        const winStartStr = (document.getElementById('payroll-window-start') || {}).value || '08:00';
+        const winEndStr = (document.getElementById('payroll-window-end') || {}).value || '17:00';
+        const meta = {
+          dailyLimit: val('payroll-limit', 8),
+          graceMin: val('payroll-grace', 0),
+          breakLimitMin: val('payroll-break-limit', 30),
+          breakGraceMin: val('payroll-break-grace', 2),
+          winStartStr, winEndStr,
+          winStartMin: parseClock(winStartStr) ?? 480,
+          winEndMin: parseClock(winEndStr) ?? 1020,
+          winGraceMin: val('payroll-window-grace', 5),
+          flagWeekend: document.getElementById('payroll-flag-weekend').checked,
+          fileName: (payrollFile.files[0] && payrollFile.files[0].name) || 'report',
+        };
         const rows = parsePayrollCSV(payrollFileText);
         if (rows.length < 2) throw new Error('File has no data rows.');
-        const meta = { dailyLimit, graceMin, flagWeekend,
-                       fileName: (payrollFile.files[0] && payrollFile.files[0].name) || 'report' };
-        const analysis = analyzePayroll(rows, meta);
+        const analysis = runPayrollAnalysis(rows, meta);
         lastPayrollAnalysis = analysis;
         lastPayrollMeta = meta;
-        renderPayrollResults(analysis, meta);
+        renderPayroll(analysis, meta);
         const n = analysis.flagged.length;
+        const fmtNote = analysis.format === 'custom' ? '' : ' (hours-only — upload a Custom Export for break & window checks)';
         payrollStatus.className = 'hint center success';
         payrollStatus.textContent = n === 0
-          ? 'Done. No one over the limit.'
-          : `Done. ${n} ${n === 1 ? 'person' : 'people'} flagged for review.`;
+          ? `Done. No flags.${fmtNote}`
+          : `Done. ${n} ${n === 1 ? 'person' : 'people'} flagged for review.${fmtNote}`;
       } catch (err) {
         console.error(err);
         payrollStatus.className = 'hint center error';
@@ -3038,7 +3321,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (payrollDownloadBtn) {
     payrollDownloadBtn.addEventListener('click', () => {
-      if (lastPayrollAnalysis && lastPayrollMeta) downloadPayrollReport(lastPayrollAnalysis, lastPayrollMeta);
+      if (lastPayrollAnalysis && lastPayrollMeta) downloadPayroll(lastPayrollAnalysis, lastPayrollMeta);
     });
   }
 });
