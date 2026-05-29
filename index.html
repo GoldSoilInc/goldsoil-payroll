@@ -25,6 +25,19 @@
 
   <main>
 
+    <!-- ===== MODE SELECTOR =====
+         Top-level switch between the two things Lucia runs from this app:
+         Commissions (the existing Salesforce-fed calculator) and Regular
+         Payroll (a Time Doctor hours-review tool). Pure show/hide of the
+         two .mode-view containers below — no shared state. -->
+    <div class="mode-switch" role="tablist" aria-label="Calculator mode">
+      <button class="mode-btn active" data-mode="commission" role="tab" aria-selected="true">Commissions</button>
+      <button class="mode-btn" data-mode="payroll" role="tab" aria-selected="false">Regular Payroll</button>
+    </div>
+
+    <!-- ===== COMMISSION VIEW — unchanged existing calculator ===== -->
+    <div id="commission-view" class="mode-view">
+
     <section class="inputs">
       <div class="period-block">
         <div class="period-label">Pay Period</div>
@@ -217,6 +230,65 @@
       </div><!-- /#trends-pane -->
 
     </section><!-- /#results -->
+
+    </div><!-- /#commission-view -->
+
+    <!-- ===== REGULAR PAYROLL VIEW — Time Doctor hours review =====
+         Lucia uploads the Time Doctor "Hours Tracked" CSV export. The app
+         parses the per-day decimal-hour columns, then flags (a) any weekday
+         over the daily limit and (b) any weekend work, since staff are only
+         scheduled Mon–Fri. Nothing here touches the commission calc or the
+         Google Sheet — it's a self-contained, in-browser review tool whose
+         output is a flag list Lucia checks against approvals. -->
+    <div id="payroll-view" class="mode-view" hidden>
+
+      <section class="inputs">
+        <div class="period-block">
+          <div class="period-label">Regular Payroll · Hours Review</div>
+          <div class="period-value" id="payroll-period-display">Upload a report</div>
+          <p class="hint">Upload the Time Doctor <em>Hours Tracked</em> export (CSV). Each person's daily hours are checked against the limit below. Weekday overages and any weekend work are flagged for you to verify against approvals — flags are not deductions.</p>
+        </div>
+
+        <div class="payroll-config">
+          <label class="payroll-field">
+            <span class="payroll-field-label">Daily limit (hrs)</span>
+            <input type="number" id="payroll-limit" class="payroll-input" value="8" min="0" max="24" step="0.25" />
+          </label>
+          <label class="payroll-field">
+            <span class="payroll-field-label">Grace (min)</span>
+            <input type="number" id="payroll-grace" class="payroll-input" value="0" min="0" max="120" step="1" />
+            <span class="payroll-field-hint">Spillover under this many minutes isn't flagged.</span>
+          </label>
+          <label class="payroll-checkbox">
+            <input type="checkbox" id="payroll-flag-weekend" checked />
+            <span>Flag weekend work (Sat/Sun)</span>
+          </label>
+        </div>
+
+        <div class="payroll-upload">
+          <label for="payroll-file" class="file-drop" id="payroll-file-drop">
+            <span class="file-drop-icon">⬆</span>
+            <span class="file-drop-text" id="payroll-file-name">Choose Time Doctor CSV…</span>
+            <input type="file" id="payroll-file" accept=".csv,text/csv" hidden />
+          </label>
+        </div>
+
+        <button id="payroll-analyze-btn" class="primary-btn" disabled>
+          <span class="btn-label">Analyze Hours</span>
+          <span class="btn-spinner" aria-hidden="true"></span>
+        </button>
+
+        <p class="hint center" id="payroll-status-line">Select a file to begin. All processing happens in your browser — nothing is uploaded anywhere.</p>
+      </section>
+
+      <section id="payroll-results" class="results hidden">
+        <div class="actions">
+          <button id="payroll-download-btn" class="secondary-btn">⬇ Download flag report (CSV)</button>
+        </div>
+        <div id="payroll-summary"></div>
+      </section>
+
+    </div><!-- /#payroll-view -->
 
     <!-- Email confirmation modal — shown when Lucia clicks "Send commission emails".
          Hidden by default; openSendEmailsModal() in script.js populates the body
