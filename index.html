@@ -246,19 +246,53 @@
         <div class="period-block">
           <div class="period-label">Regular Payroll · Hours Review</div>
           <div class="period-value" id="payroll-period-display">Upload a report</div>
-          <p class="hint">Upload the Time Doctor <em>Hours Tracked</em> export (CSV). Each person's daily hours are checked against the limit below. Weekday overages and any weekend work are flagged for you to verify against approvals — flags are not deductions.</p>
+          <p class="hint">Upload the Time Doctor <em>Custom Export</em> (CSV, <em>Daily breakdown per user</em>). Each person's daily hours, break time, and start/end times are checked against the rules below — weekday overages, breaks over the limit, work outside the operational window, and weekend work are flagged for you to verify against approvals. Flags are not deductions. An older <em>Hours Tracked</em> export still works for the hours check alone.</p>
         </div>
 
         <div class="payroll-config">
-          <label class="payroll-field">
-            <span class="payroll-field-label">Daily limit (hrs)</span>
-            <input type="number" id="payroll-limit" class="payroll-input" value="8" min="0" max="24" step="0.25" />
-          </label>
-          <label class="payroll-field">
-            <span class="payroll-field-label">Grace (min)</span>
-            <input type="number" id="payroll-grace" class="payroll-input" value="0" min="0" max="120" step="1" />
-            <span class="payroll-field-hint">Spillover under this many minutes isn't flagged.</span>
-          </label>
+
+          <fieldset class="payroll-group">
+            <legend>Hours</legend>
+            <label class="payroll-field">
+              <span class="payroll-field-label">Daily limit (hrs)</span>
+              <input type="number" id="payroll-limit" class="payroll-input" value="8" min="0" max="24" step="0.25" />
+            </label>
+            <label class="payroll-field">
+              <span class="payroll-field-label">Grace (min)</span>
+              <input type="number" id="payroll-grace" class="payroll-input" value="0" min="0" max="120" step="1" />
+            </label>
+          </fieldset>
+
+          <fieldset class="payroll-group">
+            <legend>Breaks</legend>
+            <label class="payroll-field">
+              <span class="payroll-field-label">Daily break limit (min)</span>
+              <input type="number" id="payroll-break-limit" class="payroll-input" value="30" min="0" max="240" step="1" />
+            </label>
+            <label class="payroll-field">
+              <span class="payroll-field-label">Grace (min)</span>
+              <input type="number" id="payroll-break-grace" class="payroll-input" value="2" min="0" max="60" step="1" />
+              <span class="payroll-field-hint">Absorbs rounding (e.g. 30.4 min).</span>
+            </label>
+          </fieldset>
+
+          <fieldset class="payroll-group">
+            <legend>Operational window</legend>
+            <label class="payroll-field">
+              <span class="payroll-field-label">Start</span>
+              <input type="time" id="payroll-window-start" class="payroll-input payroll-input-time" value="08:00" />
+            </label>
+            <label class="payroll-field">
+              <span class="payroll-field-label">End</span>
+              <input type="time" id="payroll-window-end" class="payroll-input payroll-input-time" value="17:00" />
+            </label>
+            <label class="payroll-field">
+              <span class="payroll-field-label">Grace (min)</span>
+              <input type="number" id="payroll-window-grace" class="payroll-input" value="5" min="0" max="60" step="1" />
+              <span class="payroll-field-hint">All times Central. Flags start-before / end-after.</span>
+            </label>
+          </fieldset>
+
           <label class="payroll-checkbox">
             <input type="checkbox" id="payroll-flag-weekend" checked />
             <span>Flag weekend work (Sat/Sun)</span>
