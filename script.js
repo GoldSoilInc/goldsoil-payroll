@@ -2555,6 +2555,269 @@ function previousMonthKey() {
   return ymKey(lastMonth);
 }
 
+/* ============================================================
+   11. REGULAR PAYROLL — Time Doctor hours review
+   ------------------------------------------------------------
+   Self-contained, separate from the commission calc. Lucia uploads the
+   Time Doctor "Hours Tracked" CSV; we parse the per-day decimal-hour
+   columns and flag two things she manually checks today:
+     (a) any WEEKDAY over the daily limit (default 8h), and
+     (b) any WEEKEND work, since staff are scheduled Mon–Fri only.
+   Output is a review list (flags, not deductions) plus a CSV export.
+   No Google Sheet, no network — everything runs in the browser.
+   ============================================================ */
+
+// Module state — last parsed/analyzed payroll run, kept so the CSV
+// download button can re-emit exactly what's on screen.
+let lastPayrollAnalysis = null;
+let lastPayrollMeta = null;
+
+// Minimal RFC-4180 CSV parser. Time Doctor headers contain quoted commas
+// (e.g. "Fri, May 1 (Decimal)"), so a naive split(',') corrupts the
+// columns — we have to honor quotes. Returns an array of row arrays.
+function parsePayrollCSV(text) {
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  // Normalize newlines so \r\n and \r both behave like \n.
+  const s = text.replace(/\r\n?/g, '\n');
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (s[i + 1] === '"') { field += '"'; i++; }  // escaped quote
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = '';
+    } else if (c === '\n') {
+      row.push(field); rows.push(row); row = []; field = '';
+    } else field += c;
+  }
+  // Flush trailing field/row (file may not end in a newline).
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  // Drop fully-empty trailing rows.
+  return rows.filter(r => r.some(cell => cell.trim() !== ''));
+}
+
+// From the header row, locate the per-day DECIMAL columns. Time Doctor
+// emits each day twice: "<Day>, Mon N (Hours & minutes)" and
+// "<Day>, Mon N (Decimal)". We only want the Decimal ones, and we must
+// NOT catch the period "Total (Decimal)" column. The day-of-week prefix
+// before the first comma tells us weekday vs weekend.
+const WEEKEND_DAYS = new Set(['Sat', 'Sun']);
+function findPayrollDayColumns(header) {
+  const cols = [];
+  for (let i = 0; i < header.length; i++) {
+    const h = (header[i] || '').trim();
+    const m = h.match(/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s*(.+?)\s*\(Decimal\)$/);
+    if (m) {
+      cols.push({
+        idx: i,
+        dayName: m[1],
+        label: (m[2] || '').trim(),          // e.g. "May 1"
+        fullLabel: `${m[1]}, ${(m[2] || '').trim()}`,
+        isWeekend: WEEKEND_DAYS.has(m[1]),
+      });
+    }
+  }
+  return cols;
+}
+
+// Locate a named column case-insensitively; returns -1 if absent.
+function findHeaderIdx(header, name) {
+  const target = name.toLowerCase();
+  return header.findIndex(h => (h || '').trim().toLowerCase() === target);
+}
+
+// Parse a decimal-hours cell to a number, tolerating blanks / stray text.
+function parsePayrollHours(v) {
+  if (v == null) return 0;
+  const n = parseFloat(String(v).trim());
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Core analysis. opts = { dailyLimit, graceMin, flagWeekend }.
+// Returns { dayColumns, flagged: [...], clean: [...], dateRange }.
+// Each flagged person: { name, email, totalHrs, overDays:[{label,dayName,hrs,excessMin}],
+//                        weekendDays:[{label,dayName,hrs}], totalOverHrs, worstDayHrs, weekendHrs }.
+function analyzePayroll(rows, opts) {
+  const dailyLimit = opts.dailyLimit;
+  const graceHrs = (opts.graceMin || 0) / 60;
+  const threshold = dailyLimit + graceHrs;   // a weekday over THIS is flagged
+  const flagWeekend = opts.flagWeekend;
+
+  const header = rows[0];
+  const dayCols = findPayrollDayColumns(header);
+  if (dayCols.length === 0) {
+    throw new Error('No daily "(Decimal)" hour columns found — is this a Time Doctor "Hours Tracked" export?');
+  }
+  const nameIdx = Math.max(0, findHeaderIdx(header, 'Name'));
+  const emailIdx = findHeaderIdx(header, 'Email');
+  const totalDecIdx = findHeaderIdx(header, 'Total (Decimal)');
+
+  const flagged = [], clean = [];
+
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const name = (row[nameIdx] || '').trim();
+    if (!name) continue;
+    const email = emailIdx >= 0 ? (row[emailIdx] || '').trim() : '';
+    const totalHrs = totalDecIdx >= 0 ? parsePayrollHours(row[totalDecIdx]) : 0;
+
+    const overDays = [], weekendDays = [];
+    let totalOverHrs = 0, worstDayHrs = 0, weekendHrs = 0;
+
+    for (const col of dayCols) {
+      const hrs = parsePayrollHours(row[col.idx]);
+      if (col.isWeekend) {
+        if (flagWeekend && hrs > 0) {
+          weekendDays.push({ label: col.fullLabel, dayName: col.dayName, hrs });
+          weekendHrs += hrs;
+        }
+      } else if (hrs > threshold) {
+        const excessHrs = hrs - dailyLimit;       // report excess vs the LIMIT, not the grace-padded threshold
+        overDays.push({ label: col.fullLabel, dayName: col.dayName, hrs, excessMin: excessHrs * 60 });
+        totalOverHrs += excessHrs;
+        if (hrs > worstDayHrs) worstDayHrs = hrs;
+      }
+    }
+
+    const rec = { name, email, totalHrs, overDays, weekendDays, totalOverHrs, worstDayHrs, weekendHrs };
+    if (overDays.length > 0 || weekendDays.length > 0) flagged.push(rec);
+    else clean.push(rec);
+  }
+
+  // Sort flagged by severity: total weekday excess + weekend hours, desc.
+  flagged.sort((a, b) => (b.totalOverHrs + b.weekendHrs) - (a.totalOverHrs + a.weekendHrs));
+  clean.sort((a, b) => b.totalHrs - a.totalHrs);
+
+  const dateRange = dayCols.length
+    ? `${dayCols[0].fullLabel} – ${dayCols[dayCols.length - 1].fullLabel}`
+    : '';
+
+  return { dayColumns: dayCols, flagged, clean, dateRange };
+}
+
+// Format minutes-over compactly, e.g. "+1h 32m" or "+18m".
+function fmtOverMin(min) {
+  const r = Math.round(min);
+  if (r >= 60) {
+    const h = Math.floor(r / 60), m = r % 60;
+    return m ? `+${h}h ${m}m` : `+${h}h`;
+  }
+  return `+${r}m`;
+}
+
+function fmtHrs(h) { return `${h.toFixed(2)}h`; }
+
+function renderPayrollResults(analysis, meta) {
+  const wrap = document.getElementById('payroll-summary');
+  const resultsSection = document.getElementById('payroll-results');
+  const { flagged, clean } = analysis;
+  const totalPeople = flagged.length + clean.length;
+
+  let html = '';
+
+  // Banner: what was analyzed + the rule that was applied.
+  const graceNote = meta.graceMin > 0 ? ` · ${meta.graceMin}m grace` : '';
+  html += `<div class="period-banner">`
+        + `<span>Report: <strong>${escapeHTML(analysis.dateRange || meta.fileName)}</strong></span>`
+        + `<span>Limit: <strong>${meta.dailyLimit}h/day${graceNote}</strong> · ${flagged.length} of ${totalPeople} flagged</span>`
+        + `</div>`;
+
+  if (flagged.length === 0) {
+    html += `<div class="payroll-clean-banner">✓ No one exceeded ${meta.dailyLimit}h on a weekday${meta.flagWeekend ? ' and no weekend work was logged' : ''} in this period.</div>`;
+    wrap.innerHTML = html;
+    resultsSection.classList.remove('hidden');
+    return;
+  }
+
+  html += `<table class="detail-table payroll-table">`
+        + `<thead><tr>`
+        + `<th>Name</th>`
+        + `<th class="num">Total</th>`
+        + `<th class="num">Days&nbsp;&gt;&nbsp;limit</th>`
+        + `<th class="num">Worst day</th>`
+        + `<th class="num">Total over</th>`
+        + `<th class="num">Weekend</th>`
+        + `</tr></thead><tbody>`;
+
+  for (const p of flagged) {
+    const worst = p.worstDayHrs > 0 ? fmtHrs(p.worstDayHrs) : '—';
+    const over = p.totalOverHrs > 0 ? `+${p.totalOverHrs.toFixed(2)}h` : '—';
+    const wknd = p.weekendHrs > 0 ? fmtHrs(p.weekendHrs) : '—';
+
+    // Build the per-day detail rows for the expandable section.
+    let detail = '';
+    if (p.overDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Weekday over ${meta.dailyLimit}h</div>`;
+      for (const d of p.overDays) {
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.label)}</span>`
+                + `<span class="mono">${fmtHrs(d.hrs)} <em>${fmtOverMin(d.excessMin)}</em></span></div>`;
+      }
+      detail += `</div>`;
+    }
+    if (p.weekendDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Weekend work</div>`;
+      for (const d of p.weekendDays) {
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.label)}</span>`
+                + `<span class="mono">${fmtHrs(d.hrs)}</span></div>`;
+      }
+      detail += `</div>`;
+    }
+
+    const wkndBadge = p.weekendDays.length ? ` <span class="payroll-badge">weekend</span>` : '';
+
+    html += `<tr class="flag-review payroll-row">`
+          + `<td><details class="payroll-person"><summary><strong>${escapeHTML(p.name)}</strong>${wkndBadge}`
+          + `<span class="payroll-email">${escapeHTML(p.email)}</span></summary>`
+          + `<div class="payroll-detail">${detail}</div></details></td>`
+          + `<td class="num">${fmtHrs(p.totalHrs)}</td>`
+          + `<td class="num">${p.overDays.length || '—'}</td>`
+          + `<td class="num">${worst}</td>`
+          + `<td class="num">${over}</td>`
+          + `<td class="num">${wknd}</td>`
+          + `</tr>`;
+  }
+  html += `</tbody></table>`;
+
+  // Clean list — collapsed, for completeness so Lucia sees everyone was reviewed.
+  if (clean.length) {
+    html += `<details class="payroll-clean"><summary>${clean.length} within limits — no flags</summary>`
+          + `<div class="payroll-clean-list">`
+          + clean.map(p => `<span>${escapeHTML(p.name)} <em>${fmtHrs(p.totalHrs)}</em></span>`).join('')
+          + `</div></details>`;
+  }
+
+  wrap.innerHTML = html;
+  resultsSection.classList.remove('hidden');
+}
+
+// CSV export of the flag list — one row per flagged day, so Lucia can
+// drop it into her review notes or attach it to an approval request.
+function downloadPayrollReport(analysis, meta) {
+  const lines = [['Name', 'Email', 'Date', 'Day', 'Hours', 'Flag', 'Over (min)'].join(',')];
+  for (const p of analysis.flagged) {
+    for (const d of p.overDays) {
+      lines.push([
+        csvEscape(p.name), csvEscape(p.email), csvEscape(d.label), csvEscape(d.dayName),
+        d.hrs.toFixed(3), `Weekday over ${meta.dailyLimit}h`, Math.round(d.excessMin),
+      ].join(','));
+    }
+    for (const d of p.weekendDays) {
+      lines.push([
+        csvEscape(p.name), csvEscape(p.email), csvEscape(d.label), csvEscape(d.dayName),
+        d.hrs.toFixed(3), 'Weekend work', '',
+      ].join(','));
+    }
+  }
+  const csv = lines.join('\r\n');
+  const stamp = (analysis.dateRange || meta.fileName || 'report').replace(/[^A-Za-z0-9]+/g, '_');
+  downloadFile(csv, `payroll_hours_flags_${stamp}.csv`, 'text/csv;charset=utf-8;');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const periodDisplay = document.getElementById('period-display');
   const calcBtn = document.getElementById('calc-btn');
@@ -2693,4 +2956,89 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   });
+
+  /* ---- MODE SWITCH: Commissions ⇄ Regular Payroll ----
+     Pure show/hide of #commission-view and #payroll-view. Each view owns
+     its own inputs/results; switching never re-runs either calc. */
+  const modeBtns = document.querySelectorAll('.mode-btn');
+  const views = { commission: document.getElementById('commission-view'),
+                  payroll:    document.getElementById('payroll-view') };
+  modeBtns.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const target = btn.dataset.mode;
+      modeBtns.forEach(b => {
+        const on = b.dataset.mode === target;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+      Object.entries(views).forEach(([mode, el]) => { if (el) el.hidden = (mode !== target); });
+    });
+  });
+
+  /* ---- REGULAR PAYROLL wiring ---- */
+  const payrollFile = document.getElementById('payroll-file');
+  const payrollFileName = document.getElementById('payroll-file-name');
+  const payrollAnalyzeBtn = document.getElementById('payroll-analyze-btn');
+  const payrollStatus = document.getElementById('payroll-status-line');
+  const payrollPeriodDisplay = document.getElementById('payroll-period-display');
+  const payrollDownloadBtn = document.getElementById('payroll-download-btn');
+  let payrollFileText = null;
+
+  if (payrollFile) {
+    payrollFile.addEventListener('change', () => {
+      const f = payrollFile.files && payrollFile.files[0];
+      if (!f) return;
+      payrollFileName.textContent = f.name;
+      payrollPeriodDisplay.textContent = f.name.replace(/\.csv$/i, '');
+      payrollStatus.className = 'hint center';
+      payrollStatus.textContent = 'Reading file…';
+      const reader = new FileReader();
+      reader.onload = () => {
+        payrollFileText = reader.result;
+        payrollAnalyzeBtn.disabled = false;
+        payrollStatus.textContent = 'File ready. Click Analyze Hours.';
+      };
+      reader.onerror = () => {
+        payrollStatus.className = 'hint center error';
+        payrollStatus.textContent = 'Could not read that file. Try re-exporting the CSV.';
+      };
+      reader.readAsText(f);
+    });
+  }
+
+  if (payrollAnalyzeBtn) {
+    payrollAnalyzeBtn.addEventListener('click', () => {
+      if (!payrollFileText) return;
+      payrollStatus.className = 'hint center';
+      payrollStatus.textContent = 'Analyzing…';
+      try {
+        const dailyLimit = parseFloat(document.getElementById('payroll-limit').value) || 8;
+        const graceMin = parseFloat(document.getElementById('payroll-grace').value) || 0;
+        const flagWeekend = document.getElementById('payroll-flag-weekend').checked;
+        const rows = parsePayrollCSV(payrollFileText);
+        if (rows.length < 2) throw new Error('File has no data rows.');
+        const meta = { dailyLimit, graceMin, flagWeekend,
+                       fileName: (payrollFile.files[0] && payrollFile.files[0].name) || 'report' };
+        const analysis = analyzePayroll(rows, meta);
+        lastPayrollAnalysis = analysis;
+        lastPayrollMeta = meta;
+        renderPayrollResults(analysis, meta);
+        const n = analysis.flagged.length;
+        payrollStatus.className = 'hint center success';
+        payrollStatus.textContent = n === 0
+          ? 'Done. No one over the limit.'
+          : `Done. ${n} ${n === 1 ? 'person' : 'people'} flagged for review.`;
+      } catch (err) {
+        console.error(err);
+        payrollStatus.className = 'hint center error';
+        payrollStatus.textContent = `Error: ${err.message}`;
+      }
+    });
+  }
+
+  if (payrollDownloadBtn) {
+    payrollDownloadBtn.addEventListener('click', () => {
+      if (lastPayrollAnalysis && lastPayrollMeta) downloadPayrollReport(lastPayrollAnalysis, lastPayrollMeta);
+    });
+  }
 });
