@@ -305,6 +305,12 @@
             <span class="file-drop-text" id="payroll-file-name">Choose Time Doctor CSV…</span>
             <input type="file" id="payroll-file" accept=".csv,text/csv" hidden />
           </label>
+          <label for="payroll-approvals-file" class="file-drop file-drop-secondary" id="payroll-approvals-drop">
+            <span class="file-drop-icon">＋</span>
+            <span class="file-drop-text" id="payroll-approvals-name">Approved hours CSV (optional)</span>
+            <input type="file" id="payroll-approvals-file" accept=".csv,text/csv" hidden />
+          </label>
+          <p class="payroll-field-hint">Approved weekend/extra-hours requests are pulled automatically from the <em>Additional Hours Request</em> tab. Upload a CSV here only to override the synced sheet.</p>
         </div>
 
         <button id="payroll-analyze-btn" class="primary-btn" disabled>
