@@ -3183,8 +3183,8 @@ function renderPayrollCustom(analysis, meta) {
   html += `<div class="payroll-flag-legend">`
         + `<span class="pf pf-hours">H · over ${meta.dailyLimit}h</span>`
         + `<span class="pf pf-break">B · break &gt; ${meta.breakLimitMin}m</span>`
-        + `<span class="pf pf-window">W · outside ${win}</span>`
-        + `<span class="pf pf-weekend">E · weekend</span>`
+        + `<span class="pf pf-window">O · outside ${win}</span>`
+        + `<span class="pf pf-weekend">W · weekend</span>`
         + `</div>`;
 
   // Approvals status + the items they cleared (transparency: cleared ≠ hidden).
@@ -3220,8 +3220,8 @@ function renderPayrollCustom(analysis, meta) {
     const chips = [];
     if (p.overDays.length) chips.push(`<span class="pf pf-hours">H${p.overDays.length}</span>`);
     if (p.breakDays.length) chips.push(`<span class="pf pf-break">B${p.breakDays.length}</span>`);
-    if (p.windowDays.length) chips.push(`<span class="pf pf-window">W${p.windowDays.length}</span>`);
-    if (p.weekendDays.length) chips.push(`<span class="pf pf-weekend">E${p.weekendDays.length}</span>`);
+    if (p.windowDays.length) chips.push(`<span class="pf pf-window">O${p.windowDays.length}</span>`);
+    if (p.weekendDays.length) chips.push(`<span class="pf pf-weekend">W${p.weekendDays.length}</span>`);
 
     // Detail sections
     let detail = '';
