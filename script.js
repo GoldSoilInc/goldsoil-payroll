@@ -2895,15 +2895,20 @@ function findColByTokens(headerLower, tokens) {
   return -1;
 }
 
-// Parse a date string flexibly → sort key (yyyymmdd int) or null.
-// Accepts M/D/YY, M/D/YYYY, YYYY-MM-DD.
+// Parse a date value → calendar sort key (yyyymmdd int) or null.
+// Reads the calendar date from the STRING and never applies a timezone shift:
+// an ISO datetime like "2026-05-02T00:00:00.000Z" (how Apps Script serializes a
+// real date cell) must stay May 2, not roll back to May 1 in a western locale.
+// Accepts M/D/YY[YYYY] (with or without trailing time), YYYY-MM-DD[Thh:mm…],
+// and a Date object (harmless if one is ever passed through).
 function parseApprovalDateKey(s) {
+  if (s instanceof Date && !isNaN(s)) return s.getFullYear()*10000+(s.getMonth()+1)*100+s.getDate();
   const str = String(s || '').trim();
   if (!str) return null;
-  let m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  let m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);        // ISO date or datetime → take date part literally
+  if (m) return (+m[1])*10000+(+m[2])*100+(+m[3]);
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);        // M/D/YYYY (optionally followed by a time)
   if (m) { let mo=+m[1], da=+m[2], yr=+m[3]; if (yr<100) yr+=2000; return yr*10000+mo*100+da; }
-  m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-  if (m) { return (+m[1])*10000+(+m[2])*100+(+m[3]); }
   const d = new Date(str);
   if (!isNaN(d)) return d.getFullYear()*10000+(d.getMonth()+1)*100+d.getDate();
   return null;
@@ -2920,6 +2925,33 @@ function classifyApprovalType(s) {
   return '';
 }
 
+// Tokenize a name → lowercased word tokens, punctuation stripped.
+function nameTokens(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[^a-z\s'-]/g, ' ').replace(/['-]/g, '')
+    .split(/\s+/).filter(Boolean);
+}
+
+// Tolerant name match between a Time Doctor display name (often first-name or
+// first + last-initial, e.g. "Jose", "Art O", "Leslie B") and the request
+// tab's full legal name ("Jose Membreno", "Art Oaing"). Deliberately
+// conservative: first name must match, and for multi-token names the last
+// token must be compatible (equal, an initial, or a prefix). This errs toward
+// NOT matching when unsure — a missed clear just leaves an item flagged for
+// manual review (safe), whereas a wrong clear would hide unapproved work.
+function tolerantNameMatch(tdName, tabName) {
+  const A = nameTokens(tdName), B = nameTokens(tabName);
+  if (!A.length || !B.length) return false;
+  if (A[0] !== B[0]) return false;                 // first name must match
+  if (A.length === 1 || B.length === 1) return true;
+  const al = A[A.length - 1], bl = B[B.length - 1];
+  if (al === bl) return true;
+  if (al.length === 1 && bl[0] === al) return true;   // "B" vs "Bernolo"
+  if (bl.length === 1 && al[0] === bl) return true;
+  if (al.startsWith(bl) || bl.startsWith(al)) return true;  // "O" vs "Oaing"
+  return false;
+}
+
 // Build an approval index from a header array + data row arrays.
 // Returns { byEmail, byName, list, detected } or null if no usable columns.
 //   byEmail/byName: Map(key -> Map(dateKey -> Set(family)))
@@ -2928,20 +2960,29 @@ function buildApprovalIndex(header, dataRows) {
   const hl = header.map(h => String(h || '').trim().toLowerCase());
   const iStatus = findColByTokens(hl, ['status', 'approval']);
   const iEmail  = findColByTokens(hl, ['email']);
-  const iName   = findColByTokens(hl, ['employee', 'name', 'person', 'requested by', 'staff']);
-  const iType   = findColByTokens(hl, ['type', 'category', 'request', 'reason']);
+  // Name: prefer an explicit "owner/employee/person" column over a generic
+  // "...name" (several columns here share an "HR Requests Hub:" prefix).
+  let iName = findColByTokens(hl, ['owner name', 'employee name', 'person name', 'requested by', 'staff name', 'owner', 'employee']);
+  if (iName < 0) iName = findColByTokens(hl, ['name', 'person', 'staff']);
+  // Type: 'type'/'category' only — NOT 'request', which would falsely match
+  // the shared "HR Requests Hub:" prefix on other columns.
+  const iType   = findColByTokens(hl, ['type', 'category', 'reason']);
   const iDate   = findColByTokens(hl, ['date', 'day']);
   // an end-date column for ranges (must differ from the start-date col)
   let iEnd = -1;
   for (let i = 0; i < hl.length; i++) {
     if (i !== iDate && /(end|to)\b/.test(hl[i]) && hl[i].includes('date')) { iEnd = i; break; }
   }
+  // Defensive: type must not collapse onto another detected column.
+  let iTypeSafe = iType;
+  if (iTypeSafe === iName || iTypeSafe === iStatus || iTypeSafe === iDate || iTypeSafe === iEmail) iTypeSafe = -1;
+  const iTypeFinal = iTypeSafe;
   if (iStatus < 0 || iDate < 0 || (iEmail < 0 && iName < 0)) {
-    return { byEmail: new Map(), byName: new Map(), list: [],
-             detected: { ok: false, iStatus, iEmail, iName, iType, iDate, iEnd } };
+    return { byEmail: new Map(), byName: new Map(), entries: [], list: [],
+             detected: { ok: false, iStatus, iEmail, iName, iType: iTypeFinal, iDate, iEnd } };
   }
 
-  const byEmail = new Map(), byName = new Map(), list = [];
+  const byEmail = new Map(), byName = new Map(), list = [], entries = [];
   const add = (map, key, dateKey, family) => {
     if (!key) return;
     if (!map.has(key)) map.set(key, new Map());
@@ -2956,9 +2997,10 @@ function buildApprovalIndex(header, dataRows) {
     const startKey = parseApprovalDateKey(row[iDate]);
     if (startKey == null) continue;
     const endKey = iEnd >= 0 ? parseApprovalDateKey(row[iEnd]) : null;
-    const family = classifyApprovalType(iType >= 0 ? row[iType] : '');
+    const family = classifyApprovalType(iTypeFinal >= 0 ? row[iTypeFinal] : '');
     const email = iEmail >= 0 ? String(row[iEmail] || '').trim().toLowerCase() : '';
-    const name  = iName  >= 0 ? normalizeName(row[iName] || '').toLowerCase() : '';
+    const rawName = iName >= 0 ? normalizeName(row[iName] || '') : '';
+    const name = rawName.toLowerCase();
 
     // Expand a date range (inclusive, capped) into individual day keys.
     const keys = [startKey];
@@ -2976,15 +3018,16 @@ function buildApprovalIndex(header, dataRows) {
       if (email) add(byEmail, email, k, family);
       if (name)  add(byName, name, k, family);
     }
-    list.push({ email, name: iName >= 0 ? normalizeName(row[iName]) : '',
-                type: iType >= 0 ? String(row[iType]||'').trim() : '',
+    // Per-row entry powers tolerant (email-or-name) matching.
+    entries.push({ email, rawName, dateKeys: new Set(keys), family });
+    list.push({ email, name: rawName, type: iTypeFinal >= 0 ? String(row[iTypeFinal]||'').trim() : '',
                 dateKey: startKey, endKey });
   }
-  return { byEmail, byName, list,
-           detected: { ok: true, iStatus, iEmail, iName, iType, iDate, iEnd,
+  return { byEmail, byName, entries, list,
+           detected: { ok: true, iStatus, iEmail, iName, iType: iTypeFinal, iDate, iEnd,
                        headers: { status: header[iStatus], date: header[iDate],
                                   email: iEmail>=0?header[iEmail]:null, name: iName>=0?header[iName]:null,
-                                  type: iType>=0?header[iType]:null, end: iEnd>=0?header[iEnd]:null } } };
+                                  type: iTypeFinal>=0?header[iTypeFinal]:null, end: iEnd>=0?header[iEnd]:null } } };
 }
 
 // Adapter: Apps Script returns each tab as an array of objects keyed by header.
@@ -3002,18 +3045,20 @@ function buildApprovalIndexFromCSV(text) {
   return buildApprovalIndex(rows[0], rows.slice(1));
 }
 
-// Is a person+date approved for a given flag family? Checks email then name.
-// family: 'weekend' | 'hours'. A generic ('') approval clears either.
-function approvalClears(approvals, email, nameLower, dateKey, family) {
-  if (!approvals) return false;
-  const check = (map, key) => {
-    if (!key) return false;
-    const m = map.get(key); if (!m) return false;
-    const fams = m.get(dateKey); if (!fams) return false;
-    return fams.has('') || fams.has(family);
-  };
-  return check(approvals.byEmail, (email||'').toLowerCase())
-      || check(approvals.byName, (nameLower||''));
+// Is a person+date approved for a given flag family? Scans approved entries,
+// matching on email when available, else a tolerant name match. family is
+// 'weekend' or 'hours'; a generic ('') approval clears either.
+function approvalClears(approvals, email, personName, dateKey, family) {
+  if (!approvals || !approvals.entries) return false;
+  const em = (email || '').toLowerCase();
+  for (const e of approvals.entries) {
+    if (!e.dateKeys.has(dateKey)) continue;
+    if (!(e.family === '' || e.family === family)) continue;
+    const emailMatch = em && e.email && em === e.email;
+    const nameMatch = !emailMatch && e.rawName && tolerantNameMatch(personName, e.rawName);
+    if (emailMatch || nameMatch) return true;
+  }
+  return false;
 }
 
 function analyzePayrollCustom(rows, opts, approvals) {
@@ -3256,9 +3301,11 @@ function downloadPayrollCustomReport(analysis, meta) {
 async function fetchApprovedHours() {
   if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.startsWith('PASTE_'))
     return { ok: false, reason: 'sheet not configured' };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);   // hard 12s cap
   try {
     const url = `${APPS_SCRIPT_URL}?token=${encodeURIComponent(APPS_SCRIPT_TOKEN)}`;
-    const res = await fetch(url, { method: 'GET' });
+    const res = await fetch(url, { method: 'GET', signal: controller.signal });
     if (!res.ok) return { ok: false, reason: `HTTP ${res.status}` };
     const body = await res.json();
     const tab = body[TAB_ADDITIONAL_HOURS];
@@ -3266,7 +3313,9 @@ async function fetchApprovedHours() {
     if (tab.error) return { ok: false, reason: tab.error };
     return { ok: true, rows: tab };
   } catch (e) {
-    return { ok: false, reason: e.message };
+    return { ok: false, reason: e.name === 'AbortError' ? 'timed out after 12s' : e.message };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -3492,6 +3541,7 @@ document.addEventListener('DOMContentLoaded', () => {
     payrollAnalyzeBtn.addEventListener('click', async () => {
       if (!payrollFileText) return;
       payrollAnalyzeBtn.disabled = true;
+      payrollAnalyzeBtn.classList.add('loading');
       payrollStatus.className = 'hint center';
       payrollStatus.textContent = 'Analyzing…';
       try {
@@ -3512,51 +3562,69 @@ document.addEventListener('DOMContentLoaded', () => {
         };
         const rows = parsePayrollCSV(payrollFileText);
         if (rows.length < 2) throw new Error('File has no data rows.');
+        const isCustom = detectPayrollFormat(rows) === 'custom';
 
-        // Load approved-hours requests. Uploaded file wins; otherwise pull the
-        // synced tab from the sheet. Only matters for the Custom Export format.
+        // Helper to render an analysis + update the status line.
+        const show = (analysis) => {
+          lastPayrollAnalysis = analysis;
+          lastPayrollMeta = meta;
+          renderPayroll(analysis, meta);
+          const n = analysis.flagged.length;
+          const supN = (analysis.suppressed || []).length;
+          const fmtNote = analysis.format === 'custom' ? '' : ' (hours-only — upload a Custom Export for break & window checks)';
+          const supNote = supN ? ` ${supN} cleared by approvals.` : '';
+          payrollStatus.className = 'hint center success';
+          payrollStatus.textContent = (n === 0
+            ? `Done. No flags.${fmtNote}`
+            : `Done. ${n} ${n === 1 ? 'person' : 'people'} flagged for review.${fmtNote}`) + supNote;
+        };
+
+        // 1) Uploaded approvals (instant) take precedence.
         let approvals = null;
-        if (detectPayrollFormat(rows) === 'custom') {
-          if (approvalsFileText) {
-            approvals = buildApprovalIndexFromCSV(approvalsFileText);
-            meta.approvalsOk = approvals.detected.ok;
-            meta.approvalsNote = approvals.detected.ok
-              ? `Approvals: ${approvals.list.length} approved request${approvals.list.length===1?'':'s'} loaded from uploaded file.`
-              : `Approvals file uploaded but columns weren't recognized (need a status, date, and name/email column) — nothing suppressed.`;
-          } else {
-            payrollStatus.textContent = 'Loading approved-hours requests…';
-            const r = await fetchApprovedHours();
-            if (r.ok) {
-              approvals = buildApprovalIndexFromObjects(r.rows);
-              meta.approvalsOk = approvals.detected.ok;
-              meta.approvalsNote = approvals.detected.ok
-                ? `Approvals: ${approvals.list.length} approved request${approvals.list.length===1?'':'s'} synced from "${TAB_ADDITIONAL_HOURS}".`
-                : `"${TAB_ADDITIONAL_HOURS}" loaded but columns weren't recognized — nothing suppressed.`;
-            } else {
-              meta.approvalsOk = false;
-              meta.approvalsNote = `Approvals not loaded (${r.reason}) — nothing suppressed. Upload an approvals CSV or check the sheet.`;
-            }
-          }
+        if (isCustom && approvalsFileText) {
+          approvals = buildApprovalIndexFromCSV(approvalsFileText);
+          meta.approvalsOk = approvals.detected.ok;
+          meta.approvalsNote = approvals.detected.ok
+            ? `Approvals: ${approvals.list.length} approved request${approvals.list.length===1?'':'s'} loaded from uploaded file.`
+            : `Approvals file uploaded but columns weren't recognized (need a status, date, and name/email column) — nothing suppressed.`;
+        } else if (isCustom) {
+          // We'll fetch the synced tab in the background (see step 3).
+          meta.approvalsNote = `Checking "${TAB_ADDITIONAL_HOURS}" for approvals…`;
+          meta.approvalsOk = true;
         }
 
-        const analysis = runPayrollAnalysis(rows, meta, approvals);
-        lastPayrollAnalysis = analysis;
-        lastPayrollMeta = meta;
-        renderPayroll(analysis, meta);
-        const n = analysis.flagged.length;
-        const supN = (analysis.suppressed || []).length;
-        const fmtNote = analysis.format === 'custom' ? '' : ' (hours-only — upload a Custom Export for break & window checks)';
-        const supNote = supN ? ` ${supN} cleared by approvals.` : '';
-        payrollStatus.className = 'hint center success';
-        payrollStatus.textContent = (n === 0
-          ? `Done. No flags.${fmtNote}`
-          : `Done. ${n} ${n === 1 ? 'person' : 'people'} flagged for review.${fmtNote}`) + supNote;
+        // 2) Render flags IMMEDIATELY — the network never blocks this.
+        show(runPayrollAnalysis(rows, meta, approvals));
+
+        // 3) Background: pull synced approvals, then re-render with suppression.
+        //    Not awaited, so the button frees up and results are already visible.
+        if (isCustom && !approvalsFileText) {
+          fetchApprovedHours().then((r) => {
+            if (r.ok) {
+              const appr = buildApprovalIndexFromObjects(r.rows);
+              meta.approvalsOk = appr.detected.ok;
+              meta.approvalsNote = appr.detected.ok
+                ? `Approvals: ${appr.list.length} approved request${appr.list.length===1?'':'s'} synced from "${TAB_ADDITIONAL_HOURS}".`
+                : `"${TAB_ADDITIONAL_HOURS}" loaded but columns weren't recognized — nothing suppressed.`;
+              show(appr.detected.ok ? analyzePayrollCustom(rows, meta, appr) : lastPayrollAnalysis);
+            } else {
+              meta.approvalsOk = false;
+              meta.approvalsNote = `Approvals not loaded (${r.reason}) — nothing suppressed. Upload an approvals CSV to apply them.`;
+              renderPayroll(lastPayrollAnalysis, meta);   // refresh just the note
+            }
+          }).catch((e) => {
+            meta.approvalsOk = false;
+            meta.approvalsNote = `Approvals not loaded (${e.message}) — nothing suppressed.`;
+            renderPayroll(lastPayrollAnalysis, meta);
+          });
+        }
       } catch (err) {
         console.error(err);
         payrollStatus.className = 'hint center error';
         payrollStatus.textContent = `Error: ${err.message}`;
       } finally {
         payrollAnalyzeBtn.disabled = false;
+        payrollAnalyzeBtn.classList.remove('loading');
       }
     });
   }
