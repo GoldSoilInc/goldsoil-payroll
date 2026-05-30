@@ -1615,3 +1615,31 @@ footer code {
   .payroll-group { gap: 0.75rem; padding: 0.6rem 0.75rem 0.75rem; }
   .payroll-table th:nth-child(3), .payroll-table td:nth-child(3) { display: none; } /* hide Total on mobile */
 }
+
+/* ---- Approvals: status note, cleared list, secondary upload ---- */
+.payroll-appr-note {
+  border-radius: var(--radius);
+  padding: 0.6rem 0.9rem;
+  font-size: 0.85rem;
+  margin: 0.25rem 0 1rem;
+}
+.payroll-appr-note.ok   { background: var(--warning-bg); border: 1px solid var(--green); color: var(--green); }
+.payroll-appr-note.warn { background: #FBF3E4; border: 1px solid #d9b25f; color: #7a5a14; }
+
+.payroll-suppressed { margin: 0 0 1.25rem; }
+.payroll-suppressed > summary {
+  cursor: pointer;
+  font-size: 0.88rem;
+  color: var(--green);
+  padding: 0.4rem 0;
+}
+.payroll-suppressed .payroll-detail { padding-left: 1.1rem; }
+
+.file-drop-secondary {
+  margin-top: 0.6rem;
+  padding: 0.85rem 1.5rem;
+  border-style: dotted;
+  background: transparent;
+  font-size: 0.85rem;
+}
+.file-drop-secondary .file-drop-icon { font-size: 1rem; }
