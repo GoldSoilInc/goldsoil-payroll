@@ -2870,7 +2870,153 @@ function parseClock(s) {
 // "07:34" passthrough for display (kept as-is from the export).
 function clockStr(s) { return String(s || '').trim(); }
 
-function analyzePayrollCustom(rows, opts) {
+/* ------------------------------------------------------------
+   Additional Hours Request (approvals) — suppression source
+   ------------------------------------------------------------
+   A tab on the Commissions Report sheet, synced from Salesforce, logs
+   requests for extra/weekend work. When a request is Approved (status
+   column), the matching flag is suppressed instead of shown. We match on
+   EMAIL first (reliable across systems) and fall back to normalized name,
+   since Time Doctor uses informal display names (e.g. "Art O") while the
+   sheet likely uses full names.
+
+   Column detection is intentionally flexible — we don't hard-code the
+   sheet's exact headers (which still need confirming). We look for a
+   status column, a date column (plus optional end-date for ranges), an
+   email column, a name column, and an optional type/category column.
+   ------------------------------------------------------------ */
+const TAB_ADDITIONAL_HOURS = 'Additional Hours Request';
+
+// Find the first header index whose lowercased text contains any token.
+function findColByTokens(headerLower, tokens) {
+  for (let i = 0; i < headerLower.length; i++) {
+    if (tokens.some(t => headerLower[i].includes(t))) return i;
+  }
+  return -1;
+}
+
+// Parse a date string flexibly → sort key (yyyymmdd int) or null.
+// Accepts M/D/YY, M/D/YYYY, YYYY-MM-DD.
+function parseApprovalDateKey(s) {
+  const str = String(s || '').trim();
+  if (!str) return null;
+  let m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) { let mo=+m[1], da=+m[2], yr=+m[3]; if (yr<100) yr+=2000; return yr*10000+mo*100+da; }
+  m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) { return (+m[1])*10000+(+m[2])*100+(+m[3]); }
+  const d = new Date(str);
+  if (!isNaN(d)) return d.getFullYear()*10000+(d.getMonth()+1)*100+d.getDate();
+  return null;
+}
+
+// Classify a request "type" string into a flag family it can clear.
+//   'weekend' → clears weekend flags;  'hours' → clears over-hours flags;
+//   '' (generic/unknown) → clears both.  Window flags are never auto-cleared.
+function classifyApprovalType(s) {
+  const t = String(s || '').toLowerCase();
+  if (!t) return '';
+  if (t.includes('weekend')) return 'weekend';
+  if (/(hour|overtime|\bot\b|additional|extra)/.test(t)) return 'hours';
+  return '';
+}
+
+// Build an approval index from a header array + data row arrays.
+// Returns { byEmail, byName, list, detected } or null if no usable columns.
+//   byEmail/byName: Map(key -> Map(dateKey -> Set(family)))
+//   list: approved entries for transparency display
+function buildApprovalIndex(header, dataRows) {
+  const hl = header.map(h => String(h || '').trim().toLowerCase());
+  const iStatus = findColByTokens(hl, ['status', 'approval']);
+  const iEmail  = findColByTokens(hl, ['email']);
+  const iName   = findColByTokens(hl, ['employee', 'name', 'person', 'requested by', 'staff']);
+  const iType   = findColByTokens(hl, ['type', 'category', 'request', 'reason']);
+  const iDate   = findColByTokens(hl, ['date', 'day']);
+  // an end-date column for ranges (must differ from the start-date col)
+  let iEnd = -1;
+  for (let i = 0; i < hl.length; i++) {
+    if (i !== iDate && /(end|to)\b/.test(hl[i]) && hl[i].includes('date')) { iEnd = i; break; }
+  }
+  if (iStatus < 0 || iDate < 0 || (iEmail < 0 && iName < 0)) {
+    return { byEmail: new Map(), byName: new Map(), list: [],
+             detected: { ok: false, iStatus, iEmail, iName, iType, iDate, iEnd } };
+  }
+
+  const byEmail = new Map(), byName = new Map(), list = [];
+  const add = (map, key, dateKey, family) => {
+    if (!key) return;
+    if (!map.has(key)) map.set(key, new Map());
+    const m = map.get(key);
+    if (!m.has(dateKey)) m.set(dateKey, new Set());
+    m.get(dateKey).add(family);
+  };
+
+  for (const row of dataRows) {
+    const status = String(row[iStatus] || '').trim().toLowerCase();
+    if (status !== 'approved') continue;               // only approved suppress
+    const startKey = parseApprovalDateKey(row[iDate]);
+    if (startKey == null) continue;
+    const endKey = iEnd >= 0 ? parseApprovalDateKey(row[iEnd]) : null;
+    const family = classifyApprovalType(iType >= 0 ? row[iType] : '');
+    const email = iEmail >= 0 ? String(row[iEmail] || '').trim().toLowerCase() : '';
+    const name  = iName  >= 0 ? normalizeName(row[iName] || '').toLowerCase() : '';
+
+    // Expand a date range (inclusive, capped) into individual day keys.
+    const keys = [startKey];
+    if (endKey != null && endKey > startKey) {
+      let y = Math.floor(startKey/10000), mo = Math.floor((startKey%10000)/100), da = startKey%100;
+      const cur = new Date(y, mo-1, da); let guard = 0;
+      while (guard++ < 120) {
+        cur.setDate(cur.getDate()+1);
+        const k = cur.getFullYear()*10000+(cur.getMonth()+1)*100+cur.getDate();
+        if (k > endKey) break;
+        keys.push(k);
+      }
+    }
+    for (const k of keys) {
+      if (email) add(byEmail, email, k, family);
+      if (name)  add(byName, name, k, family);
+    }
+    list.push({ email, name: iName >= 0 ? normalizeName(row[iName]) : '',
+                type: iType >= 0 ? String(row[iType]||'').trim() : '',
+                dateKey: startKey, endKey });
+  }
+  return { byEmail, byName, list,
+           detected: { ok: true, iStatus, iEmail, iName, iType, iDate, iEnd,
+                       headers: { status: header[iStatus], date: header[iDate],
+                                  email: iEmail>=0?header[iEmail]:null, name: iName>=0?header[iName]:null,
+                                  type: iType>=0?header[iType]:null, end: iEnd>=0?header[iEnd]:null } } };
+}
+
+// Adapter: Apps Script returns each tab as an array of objects keyed by header.
+function buildApprovalIndexFromObjects(objRows) {
+  if (!Array.isArray(objRows) || objRows.length === 0)
+    return buildApprovalIndex([], []);
+  const header = Object.keys(objRows[0]);
+  const dataRows = objRows.map(o => header.map(h => o[h]));
+  return buildApprovalIndex(header, dataRows);
+}
+// Adapter: an uploaded approvals CSV parsed into row arrays.
+function buildApprovalIndexFromCSV(text) {
+  const rows = parsePayrollCSV(text);
+  if (rows.length < 2) return buildApprovalIndex([], []);
+  return buildApprovalIndex(rows[0], rows.slice(1));
+}
+
+// Is a person+date approved for a given flag family? Checks email then name.
+// family: 'weekend' | 'hours'. A generic ('') approval clears either.
+function approvalClears(approvals, email, nameLower, dateKey, family) {
+  if (!approvals) return false;
+  const check = (map, key) => {
+    if (!key) return false;
+    const m = map.get(key); if (!m) return false;
+    const fams = m.get(dateKey); if (!fams) return false;
+    return fams.has('') || fams.has(family);
+  };
+  return check(approvals.byEmail, (email||'').toLowerCase())
+      || check(approvals.byName, (nameLower||''));
+}
+
+function analyzePayrollCustom(rows, opts, approvals) {
   const header = rows[0];
   const col = {};
   header.forEach((h, i) => { col[(h || '').trim().toLowerCase()] = i; });
@@ -2912,25 +3058,37 @@ function analyzePayrollCustom(rows, opts) {
   }
 
   const flagged = [], clean = [];
+  const suppressed = [];          // approved items we cleared, for transparency
   for (const p of byPerson.values()) {
     const overDays = [], weekendDays = [], breakDays = [], windowDays = [];
     let totalOverHrs = 0, worstDayHrs = 0, weekendHrs = 0, totalHrs = 0;
+    const nameLower = (p.name || '').toLowerCase();
 
     for (const d of p.days) {
       if (d.tt <= 0) continue;       // not a worked day
       totalHrs += d.tt;
 
       if (d.dt.isWeekend) {
-        if (flagWeekend) { weekendDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt }); weekendHrs += d.tt; }
+        if (flagWeekend) {
+          if (approvalClears(approvals, p.email, nameLower, d.dt.sort, 'weekend')) {
+            suppressed.push({ name: p.name, email: p.email, label: d.dt.label, dayName: d.dt.dayName, kind: 'Weekend work', detail: `${d.tt.toFixed(2)}h` });
+          } else {
+            weekendDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt }); weekendHrs += d.tt;
+          }
+        }
         continue;                    // weekend is the headline flag; skip weekday checks
       }
 
       // Hours (break included per company rule)
       if (d.tt > hourThresh) {
-        const excess = d.tt - dailyLimit;
-        overDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt, excessMin: excess * 60 });
-        totalOverHrs += excess;
-        if (d.tt > worstDayHrs) worstDayHrs = d.tt;
+        if (approvalClears(approvals, p.email, nameLower, d.dt.sort, 'hours')) {
+          suppressed.push({ name: p.name, email: p.email, label: d.dt.label, dayName: d.dt.dayName, kind: `Over ${dailyLimit}h`, detail: `${d.tt.toFixed(2)}h` });
+        } else {
+          const excess = d.tt - dailyLimit;
+          overDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt, excessMin: excess * 60 });
+          totalOverHrs += excess;
+          if (d.tt > worstDayHrs) worstDayHrs = d.tt;
+        }
       }
 
       // Breaks
@@ -2938,7 +3096,8 @@ function analyzePayrollCustom(rows, opts) {
         breakDays.push({ label: d.dt.label, dayName: d.dt.dayName, brkMin: d.brkMin, overMin: d.brkMin - breakLimitMin });
       }
 
-      // Operational window
+      // Operational window (not auto-cleared by an additional-hours approval —
+      // it's a separate control about WHEN work happened, not how much)
       const sMin = parseClock(d.start), eMin = parseClock(d.end);
       const early = sMin != null && sMin < winStart - winGrace;
       const late = eMin != null && eMin > winEnd + winGrace;
@@ -2956,9 +3115,10 @@ function analyzePayrollCustom(rows, opts) {
 
   flagged.sort((a, b) => (b.totalOverHrs + b.weekendHrs) - (a.totalOverHrs + a.weekendHrs) || b.flagCount - a.flagCount);
   clean.sort((a, b) => b.totalHrs - a.totalHrs);
+  suppressed.sort((a, b) => a.name.localeCompare(b.name));
 
   const dateRange = minLabel && maxLabel ? `${minLabel} – ${maxLabel}` : '';
-  return { format: 'custom', flagged, clean, dateRange };
+  return { format: 'custom', flagged, clean, suppressed, dateRange };
 }
 
 // Render the three-control custom-export results.
@@ -2981,6 +3141,21 @@ function renderPayrollCustom(analysis, meta) {
         + `<span class="pf pf-window">W · outside ${win}</span>`
         + `<span class="pf pf-weekend">E · weekend</span>`
         + `</div>`;
+
+  // Approvals status + the items they cleared (transparency: cleared ≠ hidden).
+  if (meta.approvalsNote) {
+    const cls = meta.approvalsOk ? 'payroll-appr-note ok' : 'payroll-appr-note warn';
+    html += `<div class="${cls}">${escapeHTML(meta.approvalsNote)}</div>`;
+  }
+  const sup = analysis.suppressed || [];
+  if (sup.length) {
+    html += `<details class="payroll-suppressed"><summary>✓ ${sup.length} item${sup.length===1?'':'s'} cleared by approved requests</summary>`
+          + `<div class="payroll-detail">`;
+    for (const s of sup) {
+      html += `<div class="payroll-detail-row"><span>${escapeHTML(s.name)} · ${escapeHTML(s.dayName)} ${escapeHTML(s.label)} <em class="muted">${escapeHTML(s.kind)}</em></span><span class="mono">${escapeHTML(s.detail)}</span></div>`;
+    }
+    html += `</div></details>`;
+  }
 
   if (flagged.length === 0) {
     html += `<div class="payroll-clean-banner">✓ No flags: everyone stayed within ${meta.dailyLimit}h, kept breaks under ${meta.breakLimitMin}m, worked inside ${win} CT, and logged no weekend time.</div>`;
@@ -3075,11 +3250,31 @@ function downloadPayrollCustomReport(analysis, meta) {
   downloadFile(csv, `payroll_flags_${stamp}.csv`, 'text/csv;charset=utf-8;');
 }
 
+// Fetch the Additional Hours Request tab from the same Apps Script the
+// commission side uses. Tolerant: never throws — returns {ok, rows|reason}
+// so a missing tab or offline sheet just means "nothing suppressed".
+async function fetchApprovedHours() {
+  if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.startsWith('PASTE_'))
+    return { ok: false, reason: 'sheet not configured' };
+  try {
+    const url = `${APPS_SCRIPT_URL}?token=${encodeURIComponent(APPS_SCRIPT_TOKEN)}`;
+    const res = await fetch(url, { method: 'GET' });
+    if (!res.ok) return { ok: false, reason: `HTTP ${res.status}` };
+    const body = await res.json();
+    const tab = body[TAB_ADDITIONAL_HOURS];
+    if (!tab) return { ok: false, reason: `tab "${TAB_ADDITIONAL_HOURS}" not in sheet response` };
+    if (tab.error) return { ok: false, reason: tab.error };
+    return { ok: true, rows: tab };
+  } catch (e) {
+    return { ok: false, reason: e.message };
+  }
+}
+
 // Format-aware dispatchers used by the UI handler.
-function runPayrollAnalysis(rows, meta) {
+function runPayrollAnalysis(rows, meta, approvals) {
   const fmt = detectPayrollFormat(rows);
-  if (fmt === 'custom') return analyzePayrollCustom(rows, meta);
-  return analyzePayroll(rows, meta);   // legacy wide Hours Tracked
+  if (fmt === 'custom') return analyzePayrollCustom(rows, meta, approvals);
+  return analyzePayroll(rows, meta);   // legacy wide Hours Tracked (no approvals)
 }
 function renderPayroll(analysis, meta) {
   if (analysis.format === 'custom') return renderPayrollCustom(analysis, meta);
@@ -3278,9 +3473,25 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  // Optional approvals upload (overrides the synced sheet when present).
+  const approvalsFile = document.getElementById('payroll-approvals-file');
+  const approvalsFileName = document.getElementById('payroll-approvals-name');
+  let approvalsFileText = null;
+  if (approvalsFile) {
+    approvalsFile.addEventListener('change', () => {
+      const f = approvalsFile.files && approvalsFile.files[0];
+      if (!f) { approvalsFileText = null; if (approvalsFileName) approvalsFileName.textContent = 'Approved hours CSV (optional)'; return; }
+      if (approvalsFileName) approvalsFileName.textContent = f.name;
+      const reader = new FileReader();
+      reader.onload = () => { approvalsFileText = reader.result; };
+      reader.readAsText(f);
+    });
+  }
+
   if (payrollAnalyzeBtn) {
-    payrollAnalyzeBtn.addEventListener('click', () => {
+    payrollAnalyzeBtn.addEventListener('click', async () => {
       if (!payrollFileText) return;
+      payrollAnalyzeBtn.disabled = true;
       payrollStatus.className = 'hint center';
       payrollStatus.textContent = 'Analyzing…';
       try {
@@ -3301,20 +3512,51 @@ document.addEventListener('DOMContentLoaded', () => {
         };
         const rows = parsePayrollCSV(payrollFileText);
         if (rows.length < 2) throw new Error('File has no data rows.');
-        const analysis = runPayrollAnalysis(rows, meta);
+
+        // Load approved-hours requests. Uploaded file wins; otherwise pull the
+        // synced tab from the sheet. Only matters for the Custom Export format.
+        let approvals = null;
+        if (detectPayrollFormat(rows) === 'custom') {
+          if (approvalsFileText) {
+            approvals = buildApprovalIndexFromCSV(approvalsFileText);
+            meta.approvalsOk = approvals.detected.ok;
+            meta.approvalsNote = approvals.detected.ok
+              ? `Approvals: ${approvals.list.length} approved request${approvals.list.length===1?'':'s'} loaded from uploaded file.`
+              : `Approvals file uploaded but columns weren't recognized (need a status, date, and name/email column) — nothing suppressed.`;
+          } else {
+            payrollStatus.textContent = 'Loading approved-hours requests…';
+            const r = await fetchApprovedHours();
+            if (r.ok) {
+              approvals = buildApprovalIndexFromObjects(r.rows);
+              meta.approvalsOk = approvals.detected.ok;
+              meta.approvalsNote = approvals.detected.ok
+                ? `Approvals: ${approvals.list.length} approved request${approvals.list.length===1?'':'s'} synced from "${TAB_ADDITIONAL_HOURS}".`
+                : `"${TAB_ADDITIONAL_HOURS}" loaded but columns weren't recognized — nothing suppressed.`;
+            } else {
+              meta.approvalsOk = false;
+              meta.approvalsNote = `Approvals not loaded (${r.reason}) — nothing suppressed. Upload an approvals CSV or check the sheet.`;
+            }
+          }
+        }
+
+        const analysis = runPayrollAnalysis(rows, meta, approvals);
         lastPayrollAnalysis = analysis;
         lastPayrollMeta = meta;
         renderPayroll(analysis, meta);
         const n = analysis.flagged.length;
+        const supN = (analysis.suppressed || []).length;
         const fmtNote = analysis.format === 'custom' ? '' : ' (hours-only — upload a Custom Export for break & window checks)';
+        const supNote = supN ? ` ${supN} cleared by approvals.` : '';
         payrollStatus.className = 'hint center success';
-        payrollStatus.textContent = n === 0
+        payrollStatus.textContent = (n === 0
           ? `Done. No flags.${fmtNote}`
-          : `Done. ${n} ${n === 1 ? 'person' : 'people'} flagged for review.${fmtNote}`;
+          : `Done. ${n} ${n === 1 ? 'person' : 'people'} flagged for review.${fmtNote}`) + supNote;
       } catch (err) {
         console.error(err);
         payrollStatus.className = 'hint center error';
         payrollStatus.textContent = `Error: ${err.message}`;
+      } finally {
+        payrollAnalyzeBtn.disabled = false;
       }
     });
   }
