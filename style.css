@@ -1591,6 +1591,7 @@ footer code {
   white-space: nowrap;
 }
 .pf-hours   { background: #FBE9D9; color: #8a4b1f; border-color: #e7c3a0; }
+.pf-overreq { background: #F7DFD0; color: #9a3b12; border-color: #e0a98a; }
 .pf-pending { background: #FCF3D6; color: #856404; border-color: #e7d79a; }
 .pf-break   { background: #E9EEF6; color: #2f4a73; border-color: #c2d0e6; }
 .pf-window  { background: #F3E9F6; color: #6b2f73; border-color: #d9c2e6; }
@@ -1637,6 +1638,13 @@ footer code {
   vertical-align: top;
 }
 .payroll-day-table tr.payroll-day-weekend td { background: #FBF7EC; }
+.payroll-day-table tr.payroll-day-subtotal td {
+  border-top: 1.5px solid #C9BE9F;
+  border-bottom: none;
+  background: #F3EEE1;
+  font-size: 0.84rem;
+}
+.pf-wknd-ok { background: #E3F0E3; color: #2E5D3D; border-color: #bcd8bc; }
 .payroll-note {
   display: inline-block;
   font-size: 0.74rem;
