@@ -2914,6 +2914,21 @@ function parseApprovalDateKey(s) {
   return null;
 }
 
+// Classify a request STATUS into approved / pending / rejected.
+//   approved → excess hours are included in billable
+//   pending  → a request exists but isn't approved yet → excess held as pending
+//   rejected → treated like no request → excess removed
+// A blank status on an existing request row is treated as pending (a row was
+// filed but no decision recorded). Adjust the keyword sets here if the
+// Additional Hours Request tab uses different status labels.
+function classifyApprovalStatus(s) {
+  const t = String(s || '').trim().toLowerCase();
+  if (!t) return 'pending';
+  if (t.includes('approve')) return 'approved';
+  if (/(reject|den|declin|cancel|void|withdraw)/.test(t)) return 'rejected';
+  return 'pending';
+}
+
 // Classify a request "type" string into a flag family it can clear.
 //   'weekend' → clears weekend flags;  'hours' → clears over-hours flags;
 //   '' (generic/unknown) → clears both.  Window flags are never auto-cleared.
@@ -2982,7 +2997,7 @@ function buildApprovalIndex(header, dataRows) {
              detected: { ok: false, iStatus, iEmail, iName, iType: iTypeFinal, iDate, iEnd } };
   }
 
-  const byEmail = new Map(), byName = new Map(), list = [], entries = [];
+  const byEmail = new Map(), byName = new Map(), list = [], entries = [], pendingEntries = [];
   const add = (map, key, dateKey, family) => {
     if (!key) return;
     if (!map.has(key)) map.set(key, new Map());
@@ -2992,8 +3007,8 @@ function buildApprovalIndex(header, dataRows) {
   };
 
   for (const row of dataRows) {
-    const status = String(row[iStatus] || '').trim().toLowerCase();
-    if (status !== 'approved') continue;               // only approved suppress
+    const decision = classifyApprovalStatus(row[iStatus]);
+    if (decision === 'rejected') continue;             // rejected = no effect
     const startKey = parseApprovalDateKey(row[iDate]);
     if (startKey == null) continue;
     const endKey = iEnd >= 0 ? parseApprovalDateKey(row[iEnd]) : null;
@@ -3014,16 +3029,24 @@ function buildApprovalIndex(header, dataRows) {
         keys.push(k);
       }
     }
-    for (const k of keys) {
-      if (email) add(byEmail, email, k, family);
-      if (name)  add(byName, name, k, family);
+
+    const entry = { email, rawName, dateKeys: new Set(keys), family };
+    if (decision === 'approved') {
+      for (const k of keys) {
+        if (email) add(byEmail, email, k, family);
+        if (name)  add(byName, name, k, family);
+      }
+      entries.push(entry);
+      list.push({ email, name: rawName, type: iTypeFinal >= 0 ? String(row[iTypeFinal]||'').trim() : '',
+                  dateKey: startKey, endKey });
+    } else {
+      // pending — does NOT suppress weekend flags or clear over-hours, but
+      // lets the billable calc hold the excess as "pending approval" rather
+      // than removing it.
+      pendingEntries.push(entry);
     }
-    // Per-row entry powers tolerant (email-or-name) matching.
-    entries.push({ email, rawName, dateKeys: new Set(keys), family });
-    list.push({ email, name: rawName, type: iTypeFinal >= 0 ? String(row[iTypeFinal]||'').trim() : '',
-                dateKey: startKey, endKey });
   }
-  return { byEmail, byName, entries, list,
+  return { byEmail, byName, entries, pendingEntries, list,
            detected: { ok: true, iStatus, iEmail, iName, iType: iTypeFinal, iDate, iEnd,
                        headers: { status: header[iStatus], date: header[iDate],
                                   email: iEmail>=0?header[iEmail]:null, name: iName>=0?header[iName]:null,
@@ -3061,6 +3084,89 @@ function approvalClears(approvals, email, personName, dateKey, family) {
   return false;
 }
 
+// Three-state lookup for the daily billable cap: is there an APPROVED hours
+// request, a PENDING (submitted-not-approved) one, or NONE for this person+date?
+// Only 'hours' / generic-family requests count (weekend approvals don't lift
+// the daily cap). Approved beats pending.
+function hoursRequestStatus(approvals, email, personName, dateKey) {
+  if (!approvals) return 'none';
+  const em = (email || '').toLowerCase();
+  const matches = (e) => {
+    if (!e.dateKeys.has(dateKey)) return false;
+    if (!(e.family === '' || e.family === 'hours')) return false;
+    const emailMatch = em && e.email && em === e.email;
+    if (emailMatch) return true;
+    return e.rawName && tolerantNameMatch(personName, e.rawName);
+  };
+  for (const e of (approvals.entries || []))        if (matches(e)) return 'approved';
+  for (const e of (approvals.pendingEntries || [])) if (matches(e)) return 'pending';
+  return 'none';
+}
+
+/* ------------------------------------------------------------
+   Billable-hours model (Anshul, Jun 2026)
+   ----------------------------------------------------------------
+   "Time tracked" INCLUDES the paid break, so actual work = tracked − paid break.
+
+   Rule 1 — Paid break eligibility & excess:
+     The 30-min paid break is only earned if actual work ≥ 8h. If work is
+     under 8h, the whole logged paid break is stripped (not billable). Any
+     paid break logged BEYOND 30 min is "excess" and is removed from billable
+     immediately (e.g. 8h40m tracked with a 40m break → 10m excess removed →
+     8h30m billable). "Break removed" = paid break that didn't count toward
+     billable, from either cause.
+
+   Rule 2 — Daily cap + additional-hours gate (weekdays):
+     Billable is capped at 8h30m/day (8h work + 30m paid break). Excess over
+     the cap is gated on an Additional Hours Request:
+       approved  → excess included (billable = full earned, pending = 0)
+       submitted → excess held     (billable = 8.5h, pending = excess)
+       none/rej. → excess removed   (billable = 8.5h, pending = 0)
+
+   Weekends — same pipeline, different values:
+     Weekend work must be REQUESTED. With an approved weekend request the day
+     is billable up to the weekend cap (a full weekend day = an additional
+     8h); without one, the day is flagged and contributes 0 billable. Weekend
+     constants below are independent so they can diverge from weekdays.
+
+   Total tracked always reflects raw Time tracked regardless.
+   ------------------------------------------------------------ */
+const WORK_FULL_DAY_HRS   = 8.0;   // work needed to earn the paid break AND the per-day work cap
+const PAID_BREAK_MAX_HRS  = 0.5;   // 30-min paid break, capped
+const DAILY_BILLABLE_CAP  = WORK_FULL_DAY_HRS + PAID_BREAK_MAX_HRS;  // 8.5h
+const HRS_EPS = 1e-6;              // float tolerance so 8.5 isn't "over 8.5"
+
+// Weekend model — full weekend day = an additional 8h, and weekend work is
+// only billable with an approved weekend request. Defaults: no paid break on
+// weekends (set WEEKEND_PAID_BREAK_MAX_HRS = 0.5 to mirror weekdays), cap 8h.
+const WEEKEND_WORK_FULL_DAY_HRS  = 8.0;
+const WEEKEND_PAID_BREAK_MAX_HRS = 0.0;
+const WEEKEND_BILLABLE_CAP       = 8.0;
+
+const WEEKDAY_CFG = { full: WORK_FULL_DAY_HRS,         brkMax: PAID_BREAK_MAX_HRS,         cap: DAILY_BILLABLE_CAP };
+const WEEKEND_CFG = { full: WEEKEND_WORK_FULL_DAY_HRS, brkMax: WEEKEND_PAID_BREAK_MAX_HRS, cap: WEEKEND_BILLABLE_CAP };
+
+// Compute the pre-cap billable for one day from raw tracked + paid-break hours.
+//   tt        = Time tracked (INCLUDES paid break)
+//   paidBrk   = paid break time, in hours
+//   cfg       = { full, brkMax, cap }  (WEEKDAY_CFG or WEEKEND_CFG)
+// Returns { work, earnedBreak, billableUncapped, breakStripped, excessBreak, breakRemoved }.
+//   breakStripped = paid break lost because work < full day (not earned)
+//   excessBreak   = paid break beyond the brkMax allowance (over the limit)
+//   breakRemoved  = total paid break NOT billable = paidBrk − earnedBreak
+function computeBillableDay(tt, paidBrk, cfg) {
+  const work = Math.max(0, tt - paidBrk);
+  if (work + HRS_EPS >= cfg.full) {
+    const earnedBreak = Math.min(paidBrk, cfg.brkMax);
+    return { work, earnedBreak, billableUncapped: work + earnedBreak,
+             breakStripped: 0, excessBreak: Math.max(0, paidBrk - cfg.brkMax),
+             breakRemoved: paidBrk - earnedBreak };
+  }
+  // Under a full day → no paid break earned; the logged paid break is stripped.
+  return { work, earnedBreak: 0, billableUncapped: work,
+           breakStripped: paidBrk, excessBreak: 0, breakRemoved: paidBrk };
+}
+
 function analyzePayrollCustom(rows, opts, approvals) {
   const header = rows[0];
   const col = {};
@@ -3096,6 +3202,7 @@ function analyzePayrollCustom(rows, opts, approvals) {
     byPerson.get(name).days.push({
       dt,
       tt: num(row, 'time tracked'),
+      paidBrkHrs: num(row, 'paid break time'),
       brkMin: (num(row, 'paid break time') + num(row, 'unpaid break time')) * 60,
       start: get(row, 'start time'),
       end: get(row, 'end time'),
@@ -3105,44 +3212,90 @@ function analyzePayrollCustom(rows, opts, approvals) {
   const flagged = [], clean = [];
   const suppressed = [];          // approved items we cleared, for transparency
   for (const p of byPerson.values()) {
-    const overDays = [], weekendDays = [], breakDays = [], windowDays = [];
-    let totalOverHrs = 0, worstDayHrs = 0, weekendHrs = 0, totalHrs = 0;
+    const weekendDays = [], breakDays = [], windowDays = [];
+    const pendingDays = [];       // submitted-not-approved over-cap → excess held as pending
+    const droppedDays = [];       // over cap, no/rejected request → excess auto-removed
+    const breakAdjDays = [];      // paid break stripped because work < full day (informational)
+    const excessBreakDays = [];   // paid break over the 30m allowance, removed (informational)
+    const approvedOverDays = [];  // over cap but approved → included (informational)
+    const weekendBillDays = [];   // approved weekend days that earned billable hours
+    let weekendHrs = 0;           // weekend hours flagged (unrequested) — not billable
+    let totalTracked = 0, totalBillable = 0, totalPending = 0, totalBreakRemoved = 0;
+    let worstBillableHrs = 0;
     const nameLower = (p.name || '').toLowerCase();
 
     for (const d of p.days) {
       if (d.tt <= 0) continue;       // not a worked day
-      totalHrs += d.tt;
+      totalTracked += d.tt;
 
+      // ===================== WEEKEND =====================
       if (d.dt.isWeekend) {
-        if (flagWeekend) {
-          if (approvalClears(approvals, p.email, nameLower, d.dt.sort, 'weekend')) {
-            suppressed.push({ name: p.name, email: p.email, label: d.dt.label, dayName: d.dt.dayName, kind: 'Weekend work', detail: `${d.tt.toFixed(2)}h` });
-          } else {
-            weekendDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt }); weekendHrs += d.tt;
-          }
+        if (!flagWeekend) continue;  // weekend checks disabled
+        const approved = approvalClears(approvals, p.email, nameLower, d.dt.sort, 'weekend');
+        if (!approved) {
+          // No approved weekend request → flagged, contributes 0 billable.
+          weekendDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt });
+          weekendHrs += d.tt;
+          continue;
         }
-        continue;                    // weekend is the headline flag; skip weekday checks
+        // Approved weekend work → billable under the weekend model.
+        const wb = computeBillableDay(d.tt, d.paidBrkHrs, WEEKEND_CFG);
+        let wbill = wb.billableUncapped;
+        let wremoved = 0;
+        const wover = wbill - WEEKEND_CFG.cap;
+        if (wover > HRS_EPS) { wremoved = wover; wbill = WEEKEND_CFG.cap; }  // over weekend cap → removed
+        totalBillable += wbill;
+        totalBreakRemoved += wb.breakRemoved;
+        if (wbill > worstBillableHrs) worstBillableHrs = wbill;
+        weekendBillDays.push({ label: d.dt.label, dayName: d.dt.dayName, tt: d.tt,
+                               billable: wbill, breakRemoved: wb.breakRemoved, capRemoved: wremoved });
+        suppressed.push({ name: p.name, email: p.email, label: d.dt.label, dayName: d.dt.dayName,
+                          kind: 'Weekend work (approved)', detail: `billable ${wbill.toFixed(2)}h` });
+        continue;
       }
 
-      // Hours (break included per company rule)
-      if (d.tt > hourThresh) {
-        if (approvalClears(approvals, p.email, nameLower, d.dt.sort, 'hours')) {
-          suppressed.push({ name: p.name, email: p.email, label: d.dt.label, dayName: d.dt.dayName, kind: `Over ${dailyLimit}h`, detail: `${d.tt.toFixed(2)}h` });
+      // ===================== WEEKDAY =====================
+      // ---- Rule 1: paid-break eligibility + excess → pre-cap billable ----
+      const b = computeBillableDay(d.tt, d.paidBrkHrs, WEEKDAY_CFG);
+      let billable = b.billableUncapped;
+      let pending = 0;
+      totalBreakRemoved += b.breakRemoved;
+      if (b.breakStripped > HRS_EPS) {
+        breakAdjDays.push({ label: d.dt.label, dayName: d.dt.dayName,
+                            tt: d.tt, work: b.work, stripped: b.breakStripped, billable });
+      } else if (b.excessBreak > HRS_EPS) {
+        excessBreakDays.push({ label: d.dt.label, dayName: d.dt.dayName,
+                               tt: d.tt, paidBrk: d.paidBrkHrs, excess: b.excessBreak, billable });
+      }
+
+      // ---- Rule 2: daily cap + additional-hours gate --------------------
+      const over = billable - DAILY_BILLABLE_CAP;
+      if (over > HRS_EPS) {
+        const status = hoursRequestStatus(approvals, p.email, nameLower, d.dt.sort);
+        if (status === 'approved') {
+          approvedOverDays.push({ label: d.dt.label, dayName: d.dt.dayName, tt: d.tt, billable });
+          suppressed.push({ name: p.name, email: p.email, label: d.dt.label, dayName: d.dt.dayName,
+                            kind: `Over ${DAILY_BILLABLE_CAP}h (approved)`, detail: `billable ${billable.toFixed(2)}h` });
+        } else if (status === 'pending') {
+          pending = over;
+          billable = DAILY_BILLABLE_CAP;
+          pendingDays.push({ label: d.dt.label, dayName: d.dt.dayName, tt: d.tt,
+                             billable, pending, earned: b.billableUncapped });
         } else {
-          const excess = d.tt - dailyLimit;
-          overDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt, excessMin: excess * 60 });
-          totalOverHrs += excess;
-          if (d.tt > worstDayHrs) worstDayHrs = d.tt;
+          billable = DAILY_BILLABLE_CAP;   // excess auto-removed
+          droppedDays.push({ label: d.dt.label, dayName: d.dt.dayName, tt: d.tt,
+                             billable, removed: over, earned: b.billableUncapped });
         }
       }
 
-      // Breaks
+      totalBillable += billable;
+      totalPending  += pending;
+      if (billable > worstBillableHrs) worstBillableHrs = billable;
+
+      // ---- Independent controls (unchanged) -----------------------------
       if (d.brkMin > breakThreshMin) {
         breakDays.push({ label: d.dt.label, dayName: d.dt.dayName, brkMin: d.brkMin, overMin: d.brkMin - breakLimitMin });
       }
-
-      // Operational window (not auto-cleared by an additional-hours approval —
-      // it's a separate control about WHEN work happened, not how much)
       const sMin = parseClock(d.start), eMin = parseClock(d.end);
       const early = sMin != null && sMin < winStart - winGrace;
       const late = eMin != null && eMin > winEnd + winGrace;
@@ -3151,22 +3304,30 @@ function analyzePayrollCustom(rows, opts, approvals) {
       }
     }
 
-    const rec = { name: p.name, email: p.email, group: p.group, totalHrs,
-                  overDays, weekendDays, breakDays, windowDays,
-                  totalOverHrs, worstDayHrs, weekendHrs,
-                  flagCount: overDays.length + weekendDays.length + breakDays.length + windowDays.length };
+    const rec = { name: p.name, email: p.email, group: p.group,
+                  totalTracked, totalBillable, totalPending, totalBreakRemoved, worstBillableHrs,
+                  weekendDays, breakDays, windowDays,
+                  pendingDays, droppedDays, breakAdjDays, excessBreakDays,
+                  approvedOverDays, weekendBillDays, weekendHrs,
+                  // flagCount = items that need Lucia's attention. breakAdj,
+                  // excessBreak, approvedOver, weekendBill are informational.
+                  flagCount: droppedDays.length + pendingDays.length
+                           + breakDays.length + windowDays.length + weekendDays.length };
     if (rec.flagCount > 0) flagged.push(rec); else clean.push(rec);
   }
 
-  flagged.sort((a, b) => (b.totalOverHrs + b.weekendHrs) - (a.totalOverHrs + a.weekendHrs) || b.flagCount - a.flagCount);
-  clean.sort((a, b) => b.totalHrs - a.totalHrs);
+  flagged.sort((a, b) =>
+    (b.totalPending - a.totalPending) ||
+    ((b.droppedDays.length + b.weekendHrs) - (a.droppedDays.length + a.weekendHrs)) ||
+    (b.flagCount - a.flagCount));
+  clean.sort((a, b) => b.totalBillable - a.totalBillable);
   suppressed.sort((a, b) => a.name.localeCompare(b.name));
 
   const dateRange = minLabel && maxLabel ? `${minLabel} – ${maxLabel}` : '';
   return { format: 'custom', flagged, clean, suppressed, dateRange };
 }
 
-// Render the three-control custom-export results.
+// Render the billable-hours + controls custom-export results.
 function renderPayrollCustom(analysis, meta) {
   const wrap = document.getElementById('payroll-summary');
   const resultsSection = document.getElementById('payroll-results');
@@ -3174,14 +3335,16 @@ function renderPayrollCustom(analysis, meta) {
   const total = flagged.length + clean.length;
 
   const win = `${meta.winStartStr}–${meta.winEndStr}`;
+  const cap = DAILY_BILLABLE_CAP;
   let html = `<div class="period-banner">`
            + `<span>Report: <strong>${escapeHTML(analysis.dateRange || meta.fileName)}</strong></span>`
-           + `<span>${meta.dailyLimit}h/day · break ${meta.breakLimitMin}m · window ${win} CT · ${flagged.length} of ${total} flagged</span>`
+           + `<span>${cap}h/day billable cap · paid break ${Math.round(PAID_BREAK_MAX_HRS*60)}m (work ≥ ${WORK_FULL_DAY_HRS}h) · window ${win} CT · ${flagged.length} of ${total} flagged</span>`
            + `</div>`;
 
-  // Legend of the four flag types.
+  // Legend.
   html += `<div class="payroll-flag-legend">`
-        + `<span class="pf pf-hours">H · over ${meta.dailyLimit}h</span>`
+        + `<span class="pf pf-hours">H · over ${cap}h, no request (excess removed)</span>`
+        + `<span class="pf pf-pending">P · over ${cap}h, pending approval</span>`
         + `<span class="pf pf-break">B · break &gt; ${meta.breakLimitMin}m</span>`
         + `<span class="pf pf-window">O · outside ${win}</span>`
         + `<span class="pf pf-weekend">W · weekend</span>`
@@ -3202,33 +3365,56 @@ function renderPayrollCustom(analysis, meta) {
     html += `</div></details>`;
   }
 
-  if (flagged.length === 0) {
-    html += `<div class="payroll-clean-banner">✓ No flags: everyone stayed within ${meta.dailyLimit}h, kept breaks under ${meta.breakLimitMin}m, worked inside ${win} CT, and logged no weekend time.</div>`;
-    wrap.innerHTML = html;
-    resultsSection.classList.remove('hidden');
-    return;
-  }
-
-  html += `<table class="detail-table payroll-table"><thead><tr>`
-        + `<th>Name</th><th>Flags</th>`
-        + `<th class="num">Total</th><th class="num">Days&gt;${meta.dailyLimit}h</th>`
-        + `<th class="num">Worst</th><th class="num">Break</th>`
-        + `<th class="num">Window</th><th class="num">Weekend</th>`
-        + `</tr></thead><tbody>`;
-
-  for (const p of flagged) {
+  // Always-on table — billable/pending are meaningful for everyone, so show
+  // all people, flagged first. Clean rows just carry no flag chips.
+  const renderRow = (p) => {
     const chips = [];
-    if (p.overDays.length) chips.push(`<span class="pf pf-hours">H${p.overDays.length}</span>`);
-    if (p.breakDays.length) chips.push(`<span class="pf pf-break">B${p.breakDays.length}</span>`);
-    if (p.windowDays.length) chips.push(`<span class="pf pf-window">O${p.windowDays.length}</span>`);
-    if (p.weekendDays.length) chips.push(`<span class="pf pf-weekend">W${p.weekendDays.length}</span>`);
+    if (p.droppedDays.length)  chips.push(`<span class="pf pf-hours">H${p.droppedDays.length}</span>`);
+    if (p.pendingDays.length)  chips.push(`<span class="pf pf-pending">P${p.pendingDays.length}</span>`);
+    if (p.breakDays.length)    chips.push(`<span class="pf pf-break">B${p.breakDays.length}</span>`);
+    if (p.windowDays.length)   chips.push(`<span class="pf pf-window">O${p.windowDays.length}</span>`);
+    if (p.weekendDays.length)  chips.push(`<span class="pf pf-weekend">W${p.weekendDays.length}</span>`);
 
-    // Detail sections
     let detail = '';
-    if (p.overDays.length) {
-      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Over ${meta.dailyLimit}h (weekday)</div>`;
-      for (const d of p.overDays)
-        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">${fmtHrs(d.hrs)} <em>${fmtOverMin(d.excessMin)}</em></span></div>`;
+    if (p.droppedDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Over ${cap}h — no request, excess removed</div>`;
+      for (const d of p.droppedDays)
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">tracked ${fmtHrs(d.tt)} · earned ${fmtHrs(d.earned)} → billable ${fmtHrs(d.billable)} <em>−${fmtOverMin(d.removed*60)}</em></span></div>`;
+      detail += `</div>`;
+    }
+    if (p.pendingDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head">Over ${cap}h — pending approval</div>`;
+      for (const d of p.pendingDays)
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">tracked ${fmtHrs(d.tt)} · billable ${fmtHrs(d.billable)} · pending ${fmtHrs(d.pending)}</span></div>`;
+      detail += `</div>`;
+    }
+    if (p.approvedOverDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head muted">Over ${cap}h — approved, included</div>`;
+      for (const d of p.approvedOverDays)
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">tracked ${fmtHrs(d.tt)} → billable ${fmtHrs(d.billable)}</span></div>`;
+      detail += `</div>`;
+    }
+    if (p.excessBreakDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head muted">Excess paid break removed (over ${Math.round(PAID_BREAK_MAX_HRS*60)}m)</div>`;
+      for (const d of p.excessBreakDays)
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)} <em class="muted">break ${Math.round(d.paidBrk*60)}m</em></span><span class="mono">tracked ${fmtHrs(d.tt)} → billable ${fmtHrs(d.billable)} <em>−${Math.round(d.excess*60)}m</em></span></div>`;
+      detail += `</div>`;
+    }
+    if (p.breakAdjDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head muted">Paid break not earned (work &lt; ${WORK_FULL_DAY_HRS}h)</div>`;
+      for (const d of p.breakAdjDays)
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)} <em class="muted">work ${fmtHrs(d.work)}</em></span><span class="mono">tracked ${fmtHrs(d.tt)} → billable ${fmtHrs(d.billable)} <em>−${fmtOverMin(d.stripped*60)} break</em></span></div>`;
+      detail += `</div>`;
+    }
+    if (p.weekendBillDays.length) {
+      detail += `<div class="payroll-detail-group"><div class="payroll-detail-head muted">Weekend work — approved, billable (cap ${WEEKEND_BILLABLE_CAP}h)</div>`;
+      for (const d of p.weekendBillDays) {
+        const extras = [];
+        if (d.breakRemoved > HRS_EPS) extras.push(`−${Math.round(d.breakRemoved*60)}m break`);
+        if (d.capRemoved > HRS_EPS) extras.push(`−${fmtHrs(d.capRemoved)} over cap`);
+        const ex = extras.length ? ` <em>${extras.join(', ')}</em>` : '';
+        detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">tracked ${fmtHrs(d.tt)} → billable ${fmtHrs(d.billable)}${ex}</span></div>`;
+      }
       detail += `</div>`;
     }
     if (p.breakDays.length) {
@@ -3251,29 +3437,56 @@ function renderPayrollCustom(analysis, meta) {
         detail += `<div class="payroll-detail-row"><span>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</span><span class="mono">${fmtHrs(d.hrs)}</span></div>`;
       detail += `</div>`;
     }
+    if (!detail) detail = `<div class="payroll-detail-row muted"><span>No exceptions — billable equals tracked.</span><span></span></div>`;
 
     const groupTag = p.group ? `<span class="payroll-group-tag">${escapeHTML(p.group)}</span>` : '';
-    html += `<tr class="flag-review payroll-row">`
-          + `<td><details class="payroll-person"><summary><strong>${escapeHTML(p.name)}</strong>${groupTag}`
-          + `<span class="payroll-email">${escapeHTML(p.email)}</span></summary>`
-          + `<div class="payroll-detail">${detail}</div></details></td>`
-          + `<td>${chips.join(' ')}</td>`
-          + `<td class="num">${fmtHrs(p.totalHrs)}</td>`
-          + `<td class="num">${p.overDays.length || '—'}</td>`
-          + `<td class="num">${p.worstDayHrs ? fmtHrs(p.worstDayHrs) : '—'}</td>`
-          + `<td class="num">${p.breakDays.length || '—'}</td>`
-          + `<td class="num">${p.windowDays.length || '—'}</td>`
-          + `<td class="num">${p.weekendHrs ? fmtHrs(p.weekendHrs) : '—'}</td>`
-          + `</tr>`;
-  }
+    const pendingCell = p.totalPending > HRS_EPS
+      ? `<span class="pf pf-pending">${fmtHrs(p.totalPending)}</span>` : '—';
+    const excessCell = p.totalBreakRemoved > HRS_EPS
+      ? `${Math.round(p.totalBreakRemoved*60)}m` : '—';
+    // Weekend cell: approved billable hours win the display; else unrequested flag hours.
+    const wkndBill = p.weekendBillDays.reduce((a, d) => a + d.billable, 0);
+    const weekendCell = wkndBill > HRS_EPS
+      ? `<span class="payroll-wknd-bill">${fmtHrs(wkndBill)}</span>`
+      : (p.weekendHrs ? `<span class="pf pf-weekend">${fmtHrs(p.weekendHrs)}</span>` : '—');
+    return `<tr class="${p.flagCount ? 'flag-review ' : ''}payroll-row">`
+         + `<td><details class="payroll-person"><summary><strong>${escapeHTML(p.name)}</strong>${groupTag}`
+         + `<span class="payroll-email">${escapeHTML(p.email)}</span></summary>`
+         + `<div class="payroll-detail">${detail}</div></details></td>`
+         + `<td>${chips.join(' ') || '<span class="muted">—</span>'}</td>`
+         + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
+         + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
+         + `<td class="num">${pendingCell}</td>`
+         + `<td class="num">${excessCell}</td>`
+         + `<td class="num">${p.breakDays.length || '—'}</td>`
+         + `<td class="num">${p.windowDays.length || '—'}</td>`
+         + `<td class="num">${weekendCell}</td>`
+         + `</tr>`;
+  };
+
+  html += `<table class="detail-table payroll-table"><thead><tr>`
+        + `<th>Name</th><th>Flags</th>`
+        + `<th class="num">Tracked</th><th class="num">Billable</th>`
+        + `<th class="num">Pending</th><th class="num">Excess Brk</th><th class="num">Break</th>`
+        + `<th class="num">Window</th><th class="num">Weekend</th>`
+        + `</tr></thead><tbody>`;
+  for (const p of flagged) html += renderRow(p);
   html += `</tbody></table>`;
 
   if (clean.length) {
-    html += `<details class="payroll-clean"><summary>${clean.length} with no flags</summary>`
-          + `<div class="payroll-clean-list">`
-          + clean.map(p => `<span>${escapeHTML(p.name)} <em>${fmtHrs(p.totalHrs)}</em></span>`).join('')
-          + `</div></details>`;
+    html += `<details class="payroll-clean" open><summary>${clean.length} with no flags</summary>`
+          + `<table class="detail-table payroll-table"><tbody>`;
+    for (const p of clean) html += renderRow(p);
+    html += `</tbody></table></details>`;
   }
+
+  // Grand totals across everyone.
+  const all = flagged.concat(clean);
+  const sum = (k) => all.reduce((a, p) => a + (p[k] || 0), 0);
+  html += `<div class="payroll-grand-total">`
+        + `<span>Totals — ${all.length} ${all.length === 1 ? 'person' : 'people'}</span>`
+        + `<span class="mono">tracked ${fmtHrs(sum('totalTracked'))} · billable <strong>${fmtHrs(sum('totalBillable'))}</strong> · pending ${fmtHrs(sum('totalPending'))} · break removed ${Math.round(sum('totalBreakRemoved')*60)}m</span>`
+        + `</div>`;
 
   wrap.innerHTML = html;
   resultsSection.classList.remove('hidden');
@@ -3281,18 +3494,46 @@ function renderPayrollCustom(analysis, meta) {
 
 function downloadPayrollCustomReport(analysis, meta) {
   const win = `${meta.winStartStr}-${meta.winEndStr}`;
-  const lines = [['Name', 'Email', 'User group', 'Date', 'Day', 'Flag', 'Detail'].join(',')];
+  const cap = DAILY_BILLABLE_CAP;
+  const all = analysis.flagged.concat(analysis.clean || []);
+
+  // Sheet 1 content: per-person summary (tracked / billable / pending / break removed).
+  const lines = [['Name', 'Email', 'User group', 'Total Tracked (h)', 'Total Billable (h)', 'Pending Approval (h)', 'Excess Break Removed (min)', 'Flags'].join(',')];
+  for (const p of all) {
+    const flags = [
+      p.droppedDays.length ? `H${p.droppedDays.length}` : '',
+      p.pendingDays.length ? `P${p.pendingDays.length}` : '',
+      p.breakDays.length ? `B${p.breakDays.length}` : '',
+      p.windowDays.length ? `O${p.windowDays.length}` : '',
+      p.weekendDays.length ? `W${p.weekendDays.length}` : '',
+    ].filter(Boolean).join(' ');
+    lines.push([
+      csvEscape(p.name), csvEscape(p.email), csvEscape(p.group),
+      p.totalTracked.toFixed(2), p.totalBillable.toFixed(2), p.totalPending.toFixed(2),
+      Math.round(p.totalBreakRemoved * 60),
+      csvEscape(flags),
+    ].join(','));
+  }
+
+  // Sheet 2 content: per-day exception detail, appended after a blank line.
+  lines.push('');
+  lines.push(['Name', 'Email', 'Date', 'Day', 'Exception', 'Detail'].join(','));
   const push = (p, label, dayName, flag, detail) =>
-    lines.push([csvEscape(p.name), csvEscape(p.email), csvEscape(p.group), csvEscape(label), csvEscape(dayName), csvEscape(flag), csvEscape(detail)].join(','));
-  for (const p of analysis.flagged) {
-    for (const d of p.overDays) push(p, d.label, d.dayName, `Over ${meta.dailyLimit}h`, `${d.hrs.toFixed(2)}h (${fmtOverMin(d.excessMin)})`);
+    lines.push([csvEscape(p.name), csvEscape(p.email), csvEscape(label), csvEscape(dayName), csvEscape(flag), csvEscape(detail)].join(','));
+  for (const p of analysis.flagged.concat(analysis.clean || [])) {
+    for (const d of p.droppedDays) push(p, d.label, d.dayName, `Over ${cap}h (no request, removed)`, `tracked ${d.tt.toFixed(2)}h, earned ${d.earned.toFixed(2)}h, billable ${d.billable.toFixed(2)}h, removed ${d.removed.toFixed(2)}h`);
+    for (const d of p.pendingDays) push(p, d.label, d.dayName, `Over ${cap}h (pending approval)`, `tracked ${d.tt.toFixed(2)}h, billable ${d.billable.toFixed(2)}h, pending ${d.pending.toFixed(2)}h`);
+    for (const d of p.approvedOverDays) push(p, d.label, d.dayName, `Over ${cap}h (approved)`, `tracked ${d.tt.toFixed(2)}h, billable ${d.billable.toFixed(2)}h`);
+    for (const d of p.excessBreakDays) push(p, d.label, d.dayName, `Excess paid break removed (over ${Math.round(PAID_BREAK_MAX_HRS*60)}m)`, `tracked ${d.tt.toFixed(2)}h, break ${Math.round(d.paidBrk*60)}m, removed ${Math.round(d.excess*60)}m, billable ${d.billable.toFixed(2)}h`);
+    for (const d of p.breakAdjDays) push(p, d.label, d.dayName, `Paid break not earned (work < ${WORK_FULL_DAY_HRS}h)`, `tracked ${d.tt.toFixed(2)}h, work ${d.work.toFixed(2)}h, billable ${d.billable.toFixed(2)}h`);
+    for (const d of p.weekendBillDays) push(p, d.label, d.dayName, `Weekend work (approved, billable)`, `tracked ${d.tt.toFixed(2)}h, billable ${d.billable.toFixed(2)}h${d.breakRemoved>1e-6?`, break removed ${Math.round(d.breakRemoved*60)}m`:''}${d.capRemoved>1e-6?`, over cap ${d.capRemoved.toFixed(2)}h`:''}`);
     for (const d of p.breakDays) push(p, d.label, d.dayName, `Break over ${meta.breakLimitMin}m`, `${Math.round(d.brkMin)}m (+${Math.round(d.overMin)}m)`);
     for (const d of p.windowDays) push(p, d.label, d.dayName, `Outside ${win} CT`, `${d.start}-${d.end}${d.early ? ' early' : ''}${d.late ? ' late' : ''}`);
-    for (const d of p.weekendDays) push(p, d.label, d.dayName, 'Weekend work', `${d.hrs.toFixed(2)}h`);
+    for (const d of p.weekendDays) push(p, d.label, d.dayName, 'Weekend work (unrequested, not billable)', `${d.hrs.toFixed(2)}h`);
   }
   const csv = lines.join('\r\n');
   const stamp = (analysis.dateRange || meta.fileName || 'report').replace(/[^A-Za-z0-9]+/g, '_');
-  downloadFile(csv, `payroll_flags_${stamp}.csv`, 'text/csv;charset=utf-8;');
+  downloadFile(csv, `payroll_billable_${stamp}.csv`, 'text/csv;charset=utf-8;');
 }
 
 // Fetch the Additional Hours Request tab from the same Apps Script the
