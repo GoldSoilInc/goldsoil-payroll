@@ -1612,6 +1612,44 @@ footer code {
 .payroll-detail-head.muted { color: var(--ink-muted); font-weight: 500; }
 .payroll-wknd-bill { font-family: var(--mono); color: #2E5D3D; font-weight: 600; }
 
+/* Per-day breakdown table inside an expanded person row */
+.payroll-day-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  margin: 0.25rem 0;
+}
+.payroll-day-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink-muted);
+  border-bottom: 1px solid #D7CFBF;
+  padding: 0.35rem 0.55rem;
+  white-space: nowrap;
+}
+.payroll-day-table th.num, .payroll-day-table td.num {
+  text-align: right;
+  font-family: var(--mono);
+}
+.payroll-day-table td {
+  padding: 0.3rem 0.55rem;
+  border-bottom: 1px solid #EDE6D6;
+  vertical-align: top;
+}
+.payroll-day-table tr.payroll-day-weekend td { background: #FBF7EC; }
+.payroll-note {
+  display: inline-block;
+  font-size: 0.74rem;
+  padding: 0.08rem 0.4rem;
+  border-radius: 2px;
+  background: #EFEFEF;
+  color: var(--ink-soft);
+}
+.payroll-note.ok      { background: #E3F0E3; color: #2E5D3D; }
+.payroll-note.pending { background: #FCF3D6; color: #856404; }
+.payroll-note.warn    { background: #FBE9D9; color: #8a4b1f; }
+.payroll-note.flag    { background: #F6E2E2; color: var(--red); }
+
 .payroll-group-tag {
   display: inline-block;
   font-family: var(--serif);
