@@ -3537,24 +3537,29 @@ function downloadPayrollCustomReport(analysis, meta) {
 }
 
 // Fetch the Additional Hours Request tab from the same Apps Script the
-// commission side uses. Tolerant: never throws — returns {ok, rows|reason}
-// so a missing tab or offline sheet just means "nothing suppressed".
+// commission side uses. Uses the &only= fast path so the server returns just
+// this one tab instead of serializing the whole workbook (which was timing
+// out). Tolerant: never throws — returns {ok, rows|reason} so a missing tab
+// or offline sheet just means "nothing suppressed".
 async function fetchApprovedHours() {
   if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.startsWith('PASTE_'))
     return { ok: false, reason: 'sheet not configured' };
+  const TIMEOUT_MS = 20000;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);   // hard 12s cap
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
-    const url = `${APPS_SCRIPT_URL}?token=${encodeURIComponent(APPS_SCRIPT_TOKEN)}`;
+    const url = `${APPS_SCRIPT_URL}?token=${encodeURIComponent(APPS_SCRIPT_TOKEN)}`
+              + `&only=${encodeURIComponent(TAB_ADDITIONAL_HOURS)}`;
     const res = await fetch(url, { method: 'GET', signal: controller.signal });
     if (!res.ok) return { ok: false, reason: `HTTP ${res.status}` };
     const body = await res.json();
+    if (body.error) return { ok: false, reason: body.error };
     const tab = body[TAB_ADDITIONAL_HOURS];
     if (!tab) return { ok: false, reason: `tab "${TAB_ADDITIONAL_HOURS}" not in sheet response` };
     if (tab.error) return { ok: false, reason: tab.error };
     return { ok: true, rows: tab };
   } catch (e) {
-    return { ok: false, reason: e.name === 'AbortError' ? 'timed out after 12s' : e.message };
+    return { ok: false, reason: e.name === 'AbortError' ? `timed out after ${TIMEOUT_MS/1000}s` : e.message };
   } finally {
     clearTimeout(timer);
   }
