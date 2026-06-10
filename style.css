@@ -1591,9 +1591,26 @@ footer code {
   white-space: nowrap;
 }
 .pf-hours   { background: #FBE9D9; color: #8a4b1f; border-color: #e7c3a0; }
+.pf-pending { background: #FCF3D6; color: #856404; border-color: #e7d79a; }
 .pf-break   { background: #E9EEF6; color: #2f4a73; border-color: #c2d0e6; }
 .pf-window  { background: #F3E9F6; color: #6b2f73; border-color: #d9c2e6; }
 .pf-weekend { background: #F6E2E2; color: var(--red); border-color: #e0b3b3; }
+
+.payroll-grand-total {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 0.75rem;
+  padding: 0.6rem 0.85rem;
+  background: var(--cream, #F5F0E1);
+  border: 1px solid #D7CFBF;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+.payroll-grand-total .mono { font-family: var(--mono); color: var(--ink-soft); }
+.payroll-detail-head.muted { color: var(--ink-muted); font-weight: 500; }
+.payroll-wknd-bill { font-family: var(--mono); color: #2E5D3D; font-weight: 600; }
 
 .payroll-group-tag {
   display: inline-block;
