@@ -3465,16 +3465,24 @@ function renderPayrollCustom(analysis, meta) {
     html += `</div></details>`;
   }
 
-  // Person rows. Columns mirror the per-day table: Flags · Tracked · Break ·
-  // Excess Break · Pending · Billable (Billable last). Window/Weekend are
-  // folded into the Flags chips, not their own columns.
+  // ONE table. Each person is a clickable header row showing their totals;
+  // their day rows + a subtotal row live in the SAME table (same columns,
+  // aligned), hidden until the person row is clicked.
   const fmtMin = (m) => { const r = Math.round(m); return r ? `${r}m` : '—'; };
   const dayFlagChip = (code) => {
     const map = { H: 'pf-hours', R: 'pf-overreq', P: 'pf-pending', B: 'pf-break', O: 'pf-window', W: 'pf-weekend', Wk: 'pf-wknd-ok' };
     return `<span class="pf ${map[code] || ''}">${code}</span>`;
   };
 
-  const renderRow = (p) => {
+  const all = flagged.concat(clean);
+  let html2 = `<table class="detail-table payroll-table payroll-billable-table"><thead><tr>`
+            + `<th>Name / Day</th><th>Flags</th>`
+            + `<th class="num">Tracked</th><th class="num">Break</th>`
+            + `<th class="num">Excess Brk</th><th class="num">Pending</th>`
+            + `<th class="num">Billable</th>`
+            + `</tr></thead><tbody>`;
+
+  all.forEach((p, idx) => {
     const chips = [];
     if (p.droppedDays.length)  chips.push(`<span class="pf pf-hours">H${p.droppedDays.length}</span>`);
     if (p.overReqDays.length)  chips.push(`<span class="pf pf-overreq">R${p.overReqDays.length}</span>`);
@@ -3482,87 +3490,77 @@ function renderPayrollCustom(analysis, meta) {
     if (p.breakDays.length)    chips.push(`<span class="pf pf-break">B${p.breakDays.length}</span>`);
     if (p.windowDays.length)   chips.push(`<span class="pf pf-window">O${p.windowDays.length}</span>`);
     if (p.weekendDays.length)  chips.push(`<span class="pf pf-weekend">W${p.weekendDays.length}</span>`);
-
-    // Per-day breakdown — SAME columns as the person row, with a Day column.
-    let detail = '';
-    if (p.dayRows && p.dayRows.length) {
-      detail += `<table class="detail-table payroll-table payroll-day-table"><thead><tr>`
-              + `<th>Day</th><th>Flags</th>`
-              + `<th class="num">Tracked</th><th class="num">Break</th>`
-              + `<th class="num">Excess Brk</th><th class="num">Pending</th>`
-              + `<th class="num">Billable</th>`
-              + `</tr></thead><tbody>`;
-      let dT = 0, dBrk = 0, dEx = 0, dP = 0, dBill = 0;
-      for (const d of p.dayRows) {
-        dT += d.tracked; dBrk += d.paidBrkMin/60; dEx += d.removedMin/60; dP += d.pending; dBill += d.billable;
-        const dchips = (d.flags && d.flags.length) ? d.flags.map(dayFlagChip).join(' ') : '<span class="muted">—</span>';
-        detail += `<tr class="${d.weekend ? 'payroll-day-weekend' : ''}">`
-                + `<td>${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</td>`
-                + `<td>${dchips}</td>`
-                + `<td class="num">${fmtHrs(d.tracked)}</td>`
-                + `<td class="num">${fmtMin(d.paidBrkMin)}</td>`
-                + `<td class="num">${fmtMin(d.removedMin)}</td>`
-                + `<td class="num">${d.pending > HRS_EPS ? fmtHrs(d.pending) : '—'}</td>`
-                + `<td class="num"><strong>${fmtHrs(d.billable)}</strong></td>`
-                + `</tr>`;
-      }
-      // Per-person subtotal row.
-      detail += `<tr class="payroll-day-subtotal">`
-              + `<td><strong>Subtotal</strong></td><td></td>`
-              + `<td class="num">${fmtHrs(dT)}</td>`
-              + `<td class="num">${fmtMin(dBrk*60)}</td>`
-              + `<td class="num">${fmtMin(dEx*60)}</td>`
-              + `<td class="num">${dP > HRS_EPS ? fmtHrs(dP) : '—'}</td>`
-              + `<td class="num"><strong>${fmtHrs(dBill)}</strong></td>`
-              + `</tr>`;
-      detail += `</tbody></table>`;
-    } else {
-      detail = `<div class="payroll-detail-row muted"><span>No worked days in range.</span><span></span></div>`;
-    }
-
     const groupTag = p.group ? `<span class="payroll-group-tag">${escapeHTML(p.group)}</span>` : '';
     const pendingCell = p.totalPending > HRS_EPS
       ? `<span class="pf pf-pending">${fmtHrs(p.totalPending)}</span>` : '—';
-    const excessCell = fmtMin((p.totalBreakRemoved || 0) * 60);
-    return `<tr class="${p.flagCount ? 'flag-review ' : ''}payroll-row">`
-         + `<td><details class="payroll-person"><summary><strong>${escapeHTML(p.name)}</strong>${groupTag}`
-         + `<span class="payroll-email">${escapeHTML(p.email)}</span></summary>`
-         + `<div class="payroll-detail">${detail}</div></details></td>`
-         + `<td>${chips.join(' ') || '<span class="muted">—</span>'}</td>`
-         + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
-         + `<td class="num">${fmtMin((p.totalPaidBreak || 0) * 60)}</td>`
-         + `<td class="num">${excessCell}</td>`
-         + `<td class="num">${pendingCell}</td>`
-         + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
-         + `</tr>`;
-  };
 
-  html += `<table class="detail-table payroll-table"><thead><tr>`
-        + `<th>Name</th><th>Flags</th>`
-        + `<th class="num">Tracked</th><th class="num">Break</th>`
-        + `<th class="num">Excess Brk</th><th class="num">Pending</th>`
-        + `<th class="num">Billable</th>`
-        + `</tr></thead><tbody>`;
-  for (const p of flagged) html += renderRow(p);
-  html += `</tbody></table>`;
+    // Person header row.
+    html2 += `<tr class="payroll-person-row${p.flagCount ? ' flag-review' : ''}" data-pid="${idx}" tabindex="0" role="button" aria-expanded="false">`
+           + `<td><span class="payroll-toggle">▸</span> <strong>${escapeHTML(p.name)}</strong>${groupTag}`
+           + `<span class="payroll-email">${escapeHTML(p.email)}</span></td>`
+           + `<td>${chips.join(' ') || '<span class="muted">—</span>'}</td>`
+           + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
+           + `<td class="num">${fmtMin((p.totalPaidBreak || 0) * 60)}</td>`
+           + `<td class="num">${fmtMin((p.totalBreakRemoved || 0) * 60)}</td>`
+           + `<td class="num">${pendingCell}</td>`
+           + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
+           + `</tr>`;
 
-  if (clean.length) {
-    html += `<details class="payroll-clean" open><summary>${clean.length} with no flags</summary>`
-          + `<table class="detail-table payroll-table"><tbody>`;
-    for (const p of clean) html += renderRow(p);
-    html += `</tbody></table></details>`;
-  }
+    // Day rows (hidden until expanded).
+    for (const d of (p.dayRows || [])) {
+      const dchips = (d.flags && d.flags.length) ? d.flags.map(dayFlagChip).join(' ') : '<span class="muted">—</span>';
+      html2 += `<tr class="payroll-child pid-${idx}${d.weekend ? ' payroll-day-weekend' : ''}" hidden>`
+             + `<td class="payroll-day-cell">${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</td>`
+             + `<td>${dchips}</td>`
+             + `<td class="num">${fmtHrs(d.tracked)}</td>`
+             + `<td class="num">${fmtMin(d.paidBrkMin)}</td>`
+             + `<td class="num">${fmtMin(d.removedMin)}</td>`
+             + `<td class="num">${d.pending > HRS_EPS ? fmtHrs(d.pending) : '—'}</td>`
+             + `<td class="num"><strong>${fmtHrs(d.billable)}</strong></td>`
+             + `</tr>`;
+    }
+    // Subtotal row (hidden until expanded) — echoes the person totals.
+    html2 += `<tr class="payroll-child payroll-subtotal pid-${idx}" hidden>`
+           + `<td><strong>Subtotal — ${escapeHTML(p.name)}</strong></td><td></td>`
+           + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
+           + `<td class="num">${fmtMin((p.totalPaidBreak || 0) * 60)}</td>`
+           + `<td class="num">${fmtMin((p.totalBreakRemoved || 0) * 60)}</td>`
+           + `<td class="num">${p.totalPending > HRS_EPS ? fmtHrs(p.totalPending) : '—'}</td>`
+           + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
+           + `</tr>`;
+  });
 
-  // Grand totals across everyone.
-  const all = flagged.concat(clean);
+  // Grand total row, inside the same table.
   const sum = (k) => all.reduce((a, p) => a + (p[k] || 0), 0);
-  html += `<div class="payroll-grand-total">`
-        + `<span>Totals — ${all.length} ${all.length === 1 ? 'person' : 'people'}</span>`
-        + `<span class="mono">tracked ${fmtHrs(sum('totalTracked'))} · billable <strong>${fmtHrs(sum('totalBillable'))}</strong> · pending ${fmtHrs(sum('totalPending'))} · break removed ${Math.round(sum('totalBreakRemoved')*60)}m</span>`
-        + `</div>`;
+  html2 += `<tr class="payroll-grand-row">`
+         + `<td><strong>GRAND TOTAL</strong> <span class="muted">— ${all.length} ${all.length === 1 ? 'person' : 'people'}</span></td><td></td>`
+         + `<td class="num">${fmtHrs(sum('totalTracked'))}</td>`
+         + `<td class="num">${fmtMin(sum('totalPaidBreak') * 60)}</td>`
+         + `<td class="num">${fmtMin(sum('totalBreakRemoved') * 60)}</td>`
+         + `<td class="num">${sum('totalPending') > HRS_EPS ? fmtHrs(sum('totalPending')) : '—'}</td>`
+         + `<td class="num"><strong>${fmtHrs(sum('totalBillable'))}</strong></td>`
+         + `</tr>`;
+  html2 += `</tbody></table>`;
+  html += html2;
 
   wrap.innerHTML = html;
   resultsSection.classList.remove('hidden');
+
+  // Wire up expand/collapse: clicking a person row toggles its child rows.
+  wrap.querySelectorAll('.payroll-person-row').forEach((row) => {
+    const toggle = () => {
+      const pid = row.getAttribute('data-pid');
+      const open = row.getAttribute('aria-expanded') === 'true';
+      row.setAttribute('aria-expanded', open ? 'false' : 'true');
+      const tog = row.querySelector('.payroll-toggle');
+      if (tog) tog.textContent = open ? '▸' : '▾';
+      wrap.querySelectorAll('.pid-' + pid).forEach((r) => { r.hidden = open; });
+    };
+    row.addEventListener('click', toggle);
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+  });
 }
 
 function downloadPayrollCustomReport(analysis, meta) {
