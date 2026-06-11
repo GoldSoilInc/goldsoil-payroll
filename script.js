@@ -3144,6 +3144,26 @@ function hoursRequestStatus(approvals, email, personName, dateKey) {
   return { status: 'none', reqHrs: null };
 }
 
+// Display lookup: total additional hours requested for a person on a date,
+// across matching hours-family requests (approved OR pending). Returns a
+// number of hours, or null when no request matches (→ shown as "—"). A
+// matching request with a blank hours figure contributes 0.
+function requestedHoursForDay(approvals, email, personName, dateKey) {
+  if (!approvals) return null;
+  const em = (email || '').toLowerCase();
+  const matches = (e) => {
+    if (!e.dateKeys.has(dateKey)) return false;
+    if (!(e.family === '' || e.family === 'hours')) return false;
+    const emailMatch = em && e.email && em === e.email;
+    if (emailMatch) return true;
+    return e.rawName && tolerantNameMatch(personName, e.rawName);
+  };
+  let total = 0, found = false;
+  for (const e of (approvals.entries || []))        if (matches(e)) { found = true; if (e.reqHrs != null) total += e.reqHrs; }
+  for (const e of (approvals.pendingEntries || [])) if (matches(e)) { found = true; if (e.reqHrs != null) total += e.reqHrs; }
+  return found ? total : null;
+}
+
 /* ------------------------------------------------------------
    Billable-hours model (Anshul, Jun 2026)
    ----------------------------------------------------------------
@@ -3263,7 +3283,7 @@ function analyzePayrollCustom(rows, opts, approvals) {
     const weekendBillDays = [];   // approved weekend days that earned billable hours
     const dayRows = [];           // one row per worked day → columnar detail table
     let weekendHrs = 0;           // weekend hours flagged (unrequested) — not billable
-    let totalTracked = 0, totalBillable = 0, totalPending = 0, totalBreakRemoved = 0, totalPaidBreak = 0;
+    let totalTracked = 0, totalBillable = 0, totalPending = 0, totalBreakRemoved = 0, totalPaidBreak = 0, totalRequested = 0;
     let worstBillableHrs = 0;
     const nameLower = (p.name || '').toLowerCase();
 
@@ -3280,9 +3300,11 @@ function analyzePayrollCustom(rows, opts, approvals) {
           // No approved weekend request → flagged, contributes 0 billable.
           weekendDays.push({ label: d.dt.label, dayName: d.dt.dayName, hrs: d.tt });
           weekendHrs += d.tt;
+          const wreq = requestedHoursForDay(approvals, p.email, nameLower, d.dt.sort);
+          if (wreq != null) totalRequested += wreq;
           dayRows.push({ label: d.dt.label, dayName: d.dt.dayName, weekend: true,
                          tracked: d.tt, paidBrkMin: d.paidBrkHrs*60, work: Math.max(0, d.tt - d.paidBrkHrs),
-                         billable: 0, pending: 0, removedMin: 0, flags: ['W'],
+                         billable: 0, pending: 0, removedMin: 0, reqHrs: wreq, flags: ['W'],
                          notes: ['weekend — not requested'], note_cls: 'warn' });
           continue;
         }
@@ -3301,9 +3323,11 @@ function analyzePayrollCustom(rows, opts, approvals) {
                           kind: 'Weekend work (approved)', detail: `billable ${wbill.toFixed(2)}h` });
         const wn = ['weekend — approved'];
         if (wover > HRS_EPS) wn.push(`over ${WEEKEND_BILLABLE_CAP}h cap`);
+        const wreq2 = requestedHoursForDay(approvals, p.email, nameLower, d.dt.sort);
+        if (wreq2 != null) totalRequested += wreq2;
         dayRows.push({ label: d.dt.label, dayName: d.dt.dayName, weekend: true,
                        tracked: d.tt, paidBrkMin: d.paidBrkHrs*60, work: wb.work,
-                       billable: wbill, pending: 0, removedMin: wb.breakRemoved*60, flags: ['Wk'],
+                       billable: wbill, pending: 0, removedMin: wb.breakRemoved*60, reqHrs: wreq2, flags: ['Wk'],
                        notes: wn, note_cls: 'ok' });
         continue;
       }
@@ -3397,14 +3421,16 @@ function analyzePayrollCustom(rows, opts, approvals) {
         noteCls = noteCls || 'flag';
       }
 
+      const reqHrsDay = requestedHoursForDay(approvals, p.email, nameLower, d.dt.sort);
+      if (reqHrsDay != null) totalRequested += reqHrsDay;
       dayRows.push({ label: d.dt.label, dayName: d.dt.dayName, weekend: false,
                      tracked: d.tt, paidBrkMin: d.paidBrkHrs*60, work: b.work,
-                     billable, pending, removedMin: b.breakRemoved*60, flags: dflags,
+                     billable, pending, removedMin: b.breakRemoved*60, reqHrs: reqHrsDay, flags: dflags,
                      notes, note_cls: noteCls });
     }
 
     const rec = { name: p.name, email: p.email, group: p.group,
-                  totalTracked, totalBillable, totalPending, totalBreakRemoved, totalPaidBreak, worstBillableHrs,
+                  totalTracked, totalBillable, totalPending, totalBreakRemoved, totalPaidBreak, totalRequested, worstBillableHrs,
                   weekendDays, breakDays, windowDays, dayRows,
                   pendingDays, droppedDays, breakAdjDays, excessBreakDays,
                   approvedOverDays, overReqDays, weekendBillDays, weekendHrs,
@@ -3475,10 +3501,11 @@ function renderPayrollCustom(analysis, meta) {
   };
 
   const all = flagged.concat(clean);
+  const fmtReq = (v) => (v != null && v > HRS_EPS) ? fmtHrs(v) : '—';
   let html2 = `<table class="detail-table payroll-table payroll-billable-table"><thead><tr>`
             + `<th>Name / Day</th><th>Flags</th>`
             + `<th class="num">Tracked</th><th class="num">Break</th>`
-            + `<th class="num">Excess Brk</th><th class="num">Pending</th>`
+            + `<th class="num">Excess Brk</th><th class="num">Requested</th><th class="num">Pending</th>`
             + `<th class="num">Billable</th>`
             + `</tr></thead><tbody>`;
 
@@ -3502,6 +3529,7 @@ function renderPayrollCustom(analysis, meta) {
            + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
            + `<td class="num">${fmtMin((p.totalPaidBreak || 0) * 60)}</td>`
            + `<td class="num">${fmtMin((p.totalBreakRemoved || 0) * 60)}</td>`
+           + `<td class="num">${fmtReq(p.totalRequested)}</td>`
            + `<td class="num">${pendingCell}</td>`
            + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
            + `</tr>`;
@@ -3515,6 +3543,7 @@ function renderPayrollCustom(analysis, meta) {
              + `<td class="num">${fmtHrs(d.tracked)}</td>`
              + `<td class="num">${fmtMin(d.paidBrkMin)}</td>`
              + `<td class="num">${fmtMin(d.removedMin)}</td>`
+             + `<td class="num">${fmtReq(d.reqHrs)}</td>`
              + `<td class="num">${d.pending > HRS_EPS ? fmtHrs(d.pending) : '—'}</td>`
              + `<td class="num"><strong>${fmtHrs(d.billable)}</strong></td>`
              + `</tr>`;
@@ -3525,6 +3554,7 @@ function renderPayrollCustom(analysis, meta) {
            + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
            + `<td class="num">${fmtMin((p.totalPaidBreak || 0) * 60)}</td>`
            + `<td class="num">${fmtMin((p.totalBreakRemoved || 0) * 60)}</td>`
+           + `<td class="num">${fmtReq(p.totalRequested)}</td>`
            + `<td class="num">${p.totalPending > HRS_EPS ? fmtHrs(p.totalPending) : '—'}</td>`
            + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
            + `</tr>`;
@@ -3537,6 +3567,7 @@ function renderPayrollCustom(analysis, meta) {
          + `<td class="num">${fmtHrs(sum('totalTracked'))}</td>`
          + `<td class="num">${fmtMin(sum('totalPaidBreak') * 60)}</td>`
          + `<td class="num">${fmtMin(sum('totalBreakRemoved') * 60)}</td>`
+         + `<td class="num">${fmtReq(sum('totalRequested'))}</td>`
          + `<td class="num">${sum('totalPending') > HRS_EPS ? fmtHrs(sum('totalPending')) : '—'}</td>`
          + `<td class="num"><strong>${fmtHrs(sum('totalBillable'))}</strong></td>`
          + `</tr>`;
@@ -3569,7 +3600,7 @@ function downloadPayrollCustomReport(analysis, meta) {
   const all = analysis.flagged.concat(analysis.clean || []);
 
   // Sheet 1 content: per-person summary (tracked / billable / pending / break removed).
-  const lines = [['Name', 'Email', 'User group', 'Total Tracked (h)', 'Total Billable (h)', 'Pending Approval (h)', 'Excess Break Removed (min)', 'Flags'].join(',')];
+  const lines = [['Name', 'Email', 'User group', 'Total Tracked (h)', 'Total Billable (h)', 'Excess Break Removed (min)', 'Additional Hrs Requested (h)', 'Pending Approval (h)', 'Flags'].join(',')];
   for (const p of all) {
     const flags = [
       p.droppedDays.length ? `H${p.droppedDays.length}` : '',
@@ -3581,8 +3612,9 @@ function downloadPayrollCustomReport(analysis, meta) {
     ].filter(Boolean).join(' ');
     lines.push([
       csvEscape(p.name), csvEscape(p.email), csvEscape(p.group),
-      p.totalTracked.toFixed(2), p.totalBillable.toFixed(2), p.totalPending.toFixed(2),
-      Math.round(p.totalBreakRemoved * 60),
+      p.totalTracked.toFixed(2), p.totalBillable.toFixed(2),
+      Math.round(p.totalBreakRemoved * 60), (p.totalRequested || 0).toFixed(2),
+      p.totalPending.toFixed(2),
       csvEscape(flags),
     ].join(','));
   }
