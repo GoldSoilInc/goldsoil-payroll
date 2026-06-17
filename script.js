@@ -631,8 +631,12 @@ function calcLAMAdvances(contractedDeals, period) {
         const reason = !p
           ? `${owner} not in People tab — treated as inactive, not chasing former employees.`
           : `${owner} marked Inactive in People tab — not chasing former employees.`;
+        // Attribute to '—' (not the owner) so the renderer suppresses this line —
+        // it's a $0 no-payout skip, and surfacing a former employee as a person row
+        // under (Unassigned) is review noise. Matches the non-person branch above.
+        // The owner's name is preserved in the note for anyone scanning entries.
         entries.push({
-          person: owner, role: 'LAM', period, source: contractId, type: 'LAM Retraction',
+          person: '—', role: 'LAM', period, source: contractId, type: 'LAM Retraction',
           amount: 0, calc: '—', notes: `Retraction skipped — ${reason}`, flag: 'REVIEW',
         });
         continue;
