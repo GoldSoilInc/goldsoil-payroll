@@ -968,7 +968,7 @@ function calcLIMLIA(approvedLeads, period) {
     const leadId = lead.Lead_ID || lead['Lead ID'] || lead['Seller Name: Lead ID (18)']
       || lead['Property Contract: Contract Name'] || '?';
     const lia = (lead.LIA_Texter || lead['LIA Texter'] || lead.Sourcer || lead['Sourcer']
-      || lead['Seller Name: Sourcer'] || '').trim() || null;
+      || lead['Seller Name: Sourcer (Text)'] || lead['Seller Name: Sourcer'] || '').trim() || null;
     const lim = (lead.LIM_Phone_Qualifier || lead['LIM Phone Qualifier'] || lead.Qualifier
       || lead['Qualifier'] || lead['Seller Name: Qualifier'] || '').trim() || null;
     const category = (lead.Lead_Category || lead['Lead Category'] || lead.AILeadCategory
