@@ -3587,7 +3587,6 @@ function renderPayrollCustom(analysis, meta) {
     const pendingCell = p.totalPending > HRS_EPS
       ? `<span class="pf pf-pending">${fmtHrs(p.totalPending)}</span>` : '—';
     const rate = payrollRateFor(p, meta);
-    const rateTag = (!ratesLoading && rate != null) ? ` <span class="muted">@ ${fmtUSD(rate)}/h</span>` : '';
 
     // Person header row.
     html2 += `<tr class="payroll-person-row${p.flagCount ? ' flag-review' : ''}" data-pid="${idx}" tabindex="0" role="button" aria-expanded="false">`
@@ -3600,7 +3599,7 @@ function renderPayrollCustom(analysis, meta) {
            + `<td class="num">${fmtReq(p.totalRequested)}</td>`
            + `<td class="num">${pendingCell}</td>`
            + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
-           + `<td class="num"><strong>${amtCell(p.totalBillable, rate)}</strong>${rateTag}</td>`
+           + `<td class="num"><strong>${amtCell(p.totalBillable, rate)}</strong></td>`
            + `</tr>`;
 
     // Day rows (hidden until expanded).
@@ -3722,18 +3721,20 @@ function downloadPayrollCustomReport(analysis, meta) {
 // Build a fast rate lookup from People-tab rows: by lowercased email (primary)
 // and by lowercased normalized name (fallback). Value is the USD/hr rate.
 function buildRateLookup(peopleRows) {
-  const byEmail = {}, byName = {};
+  const byEmail = {}, byName = {}, list = [];
   let count = 0;
   for (const row of (peopleRows || [])) {
     const rate = parseCompRate(row['Compensation Rate'] || row['Compensation Rate (USD)'] || row['Comp Rate']);
     if (rate == null) continue;
     const email = String(row['Email'] || '').trim().toLowerCase();
-    const name = normalizeName(row['Person Name'] || row['Name'] || row['Person'] || '').toLowerCase();
+    const rawName = normalizeName(row['Person Name'] || row['Name'] || row['Person'] || '');
+    const name = rawName.toLowerCase();
     if (email) byEmail[email] = rate;
     if (name) byName[name] = rate;
+    list.push({ name: rawName, rate });   // for tolerant fallback (middle names, etc.)
     count++;
   }
-  return { byEmail, byName, count };
+  return { byEmail, byName, list, count };
 }
 
 // Fetch the People tab (Compensation Rate column) via the same &only= fast path
@@ -3772,6 +3773,17 @@ function payrollRateFor(p, meta) {
   if (email && lk.byEmail[email] != null) return lk.byEmail[email];
   const name = normalizeName(p.name).toLowerCase();
   if (name && lk.byName[name] != null) return lk.byName[name];
+  // Tolerant fallback: Time Doctor names carry middle names / different email
+  // domains than the People tab (e.g. "Ellyse Mae Tadifa" → "Ellyse Tadifa").
+  // Same first name + compatible last token; accepted ONLY if exactly one
+  // roster row matches, so an ambiguous name stays blank rather than mis-pay.
+  if (p.name && lk.list && lk.list.length) {
+    let hit = null, n = 0;
+    for (const e of lk.list) {
+      if (tolerantNameMatch(p.name, e.name)) { hit = e; if (++n > 1) break; }
+    }
+    if (n === 1) return hit.rate;
+  }
   return null;
 }
 
