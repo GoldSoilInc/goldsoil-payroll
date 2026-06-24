@@ -202,9 +202,21 @@ function buildPeopleFromSheet(peopleRows) {
       // If blank, the row is dropped from the CSV and the count appears
       // in the post-download status line.
       contractName: normalizeName(row['Contract Name'] || row['ContractName'] || '') || null,
+      // Compensation Rate = hourly pay rate in USD (People tab). Used by the
+      // Regular Payroll table to compute billable amount = billable hrs × rate.
+      // Blank = no rate on file (amount shown as "—" until HR fills it in).
+      compRate: parseCompRate(row['Compensation Rate'] || row['Compensation Rate (USD)'] || row['Comp Rate']),
     };
   }
   return people;
+}
+
+// Parse an hourly Compensation Rate cell into a number (USD/hr). Strips "$" and
+// commas; blank or unparseable → null (treated as "no rate set", not $0).
+function parseCompRate(v) {
+  if (v == null || v === '') return null;
+  const n = parseFloat(String(v).replace(/[^0-9.\-]/g, ''));
+  return Number.isFinite(n) ? n : null;
 }
 
 /* ------------------------------------------------------------
@@ -3523,6 +3535,10 @@ function renderPayrollCustom(analysis, meta) {
     const cls = meta.approvalsOk ? 'payroll-appr-note ok' : 'payroll-appr-note warn';
     html += `<div class="${cls}">${escapeHTML(meta.approvalsNote)}</div>`;
   }
+  if (meta.ratesNote) {
+    const rcls = (meta.rateLookup && meta.rateLookup.count) ? 'payroll-appr-note ok' : 'payroll-appr-note warn';
+    html += `<div class="${rcls}">${escapeHTML(meta.ratesNote)}</div>`;
+  }
   const sup = analysis.suppressed || [];
   if (sup.length) {
     html += `<details class="payroll-suppressed"><summary>✓ ${sup.length} item${sup.length===1?'':'s'} cleared by approved requests</summary>`
@@ -3544,11 +3560,19 @@ function renderPayrollCustom(analysis, meta) {
 
   const all = flagged.concat(clean);
   const fmtReq = (v) => (v != null && v > HRS_EPS) ? fmtHrs(v) : '—';
+  // Amount = billable hrs × USD/hr Compensation Rate. rateLookup is undefined
+  // while the People tab loads ("…"), null if it failed/blank ("—").
+  const ratesLoading = (meta.rateLookup === undefined);
+  const amtCell = (hours, rate) => {
+    if (ratesLoading) return '<span class="muted">…</span>';
+    if (rate == null) return '<span class="muted">—</span>';
+    return fmtUSD(hours * rate);
+  };
   let html2 = `<table class="detail-table payroll-table payroll-billable-table"><thead><tr>`
             + `<th>Name / Day</th><th>Flags</th>`
             + `<th class="num">Tracked</th><th class="num">Break</th>`
             + `<th class="num">Excess Brk</th><th class="num">Requested</th><th class="num">Pending</th>`
-            + `<th class="num">Billable</th>`
+            + `<th class="num">Billable</th><th class="num">Amount (USD)</th>`
             + `</tr></thead><tbody>`;
 
   all.forEach((p, idx) => {
@@ -3562,6 +3586,8 @@ function renderPayrollCustom(analysis, meta) {
     const groupTag = p.group ? `<span class="payroll-group-tag">${escapeHTML(p.group)}</span>` : '';
     const pendingCell = p.totalPending > HRS_EPS
       ? `<span class="pf pf-pending">${fmtHrs(p.totalPending)}</span>` : '—';
+    const rate = payrollRateFor(p, meta);
+    const rateTag = (!ratesLoading && rate != null) ? ` <span class="muted">@ ${fmtUSD(rate)}/h</span>` : '';
 
     // Person header row.
     html2 += `<tr class="payroll-person-row${p.flagCount ? ' flag-review' : ''}" data-pid="${idx}" tabindex="0" role="button" aria-expanded="false">`
@@ -3574,6 +3600,7 @@ function renderPayrollCustom(analysis, meta) {
            + `<td class="num">${fmtReq(p.totalRequested)}</td>`
            + `<td class="num">${pendingCell}</td>`
            + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
+           + `<td class="num"><strong>${amtCell(p.totalBillable, rate)}</strong>${rateTag}</td>`
            + `</tr>`;
 
     // Day rows (hidden until expanded).
@@ -3588,6 +3615,7 @@ function renderPayrollCustom(analysis, meta) {
              + `<td class="num">${fmtReq(d.reqHrs)}</td>`
              + `<td class="num">${d.pending > HRS_EPS ? fmtHrs(d.pending) : '—'}</td>`
              + `<td class="num"><strong>${fmtHrs(d.billable)}</strong></td>`
+             + `<td class="num">${amtCell(d.billable, rate)}</td>`
              + `</tr>`;
     }
     // Subtotal row (hidden until expanded) — echoes the person totals.
@@ -3599,11 +3627,16 @@ function renderPayrollCustom(analysis, meta) {
            + `<td class="num">${fmtReq(p.totalRequested)}</td>`
            + `<td class="num">${p.totalPending > HRS_EPS ? fmtHrs(p.totalPending) : '—'}</td>`
            + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
+           + `<td class="num"><strong>${amtCell(p.totalBillable, rate)}</strong></td>`
            + `</tr>`;
   });
 
   // Grand total row, inside the same table.
   const sum = (k) => all.reduce((a, p) => a + (p[k] || 0), 0);
+  // Amount total = Σ (billable × rate) over people who have a rate on file.
+  let grandAmt = 0, anyRate = false;
+  for (const p of all) { const rt = payrollRateFor(p, meta); if (rt != null) { grandAmt += p.totalBillable * rt; anyRate = true; } }
+  const grandAmtCell = ratesLoading ? '<span class="muted">…</span>' : (anyRate ? fmtUSD(grandAmt) : '<span class="muted">—</span>');
   html2 += `<tr class="payroll-grand-row">`
          + `<td><strong>GRAND TOTAL</strong> <span class="muted">— ${all.length} ${all.length === 1 ? 'person' : 'people'}</span></td><td></td>`
          + `<td class="num">${fmtHrs(sum('totalTracked'))}</td>`
@@ -3612,6 +3645,7 @@ function renderPayrollCustom(analysis, meta) {
          + `<td class="num">${fmtReq(sum('totalRequested'))}</td>`
          + `<td class="num">${sum('totalPending') > HRS_EPS ? fmtHrs(sum('totalPending')) : '—'}</td>`
          + `<td class="num"><strong>${fmtHrs(sum('totalBillable'))}</strong></td>`
+         + `<td class="num"><strong>${grandAmtCell}</strong></td>`
          + `</tr>`;
   html2 += `</tbody></table>`;
   html += html2;
@@ -3642,7 +3676,7 @@ function downloadPayrollCustomReport(analysis, meta) {
   const all = analysis.flagged.concat(analysis.clean || []);
 
   // Sheet 1 content: per-person summary (tracked / billable / pending / break removed).
-  const lines = [['Name', 'Email', 'User group', 'Total Tracked (h)', 'Total Billable (h)', 'Excess Break Removed (min)', 'Additional Hrs Requested (h)', 'Pending Approval (h)', 'Flags'].join(',')];
+  const lines = [['Name', 'Email', 'User group', 'Total Tracked (h)', 'Total Billable (h)', 'Comp Rate (USD/h)', 'Billable Amount (USD)', 'Excess Break Removed (min)', 'Additional Hrs Requested (h)', 'Pending Approval (h)', 'Flags'].join(',')];
   for (const p of all) {
     const flags = [
       p.droppedDays.length ? `H${p.droppedDays.length}` : '',
@@ -3652,9 +3686,11 @@ function downloadPayrollCustomReport(analysis, meta) {
       p.windowDays.length ? `O${p.windowDays.length}` : '',
       p.weekendDays.length ? `W${p.weekendDays.length}` : '',
     ].filter(Boolean).join(' ');
+    const rate = payrollRateFor(p, meta);
     lines.push([
       csvEscape(p.name), csvEscape(p.email), csvEscape(p.group),
       p.totalTracked.toFixed(2), p.totalBillable.toFixed(2),
+      rate != null ? rate.toFixed(2) : '', rate != null ? (p.totalBillable * rate).toFixed(2) : '',
       Math.round(p.totalBreakRemoved * 60), (p.totalRequested || 0).toFixed(2),
       p.totalPending.toFixed(2),
       csvEscape(flags),
@@ -3681,6 +3717,62 @@ function downloadPayrollCustomReport(analysis, meta) {
   const csv = lines.join('\r\n');
   const stamp = (analysis.dateRange || meta.fileName || 'report').replace(/[^A-Za-z0-9]+/g, '_');
   downloadFile(csv, `payroll_billable_${stamp}.csv`, 'text/csv;charset=utf-8;');
+}
+
+// Build a fast rate lookup from People-tab rows: by lowercased email (primary)
+// and by lowercased normalized name (fallback). Value is the USD/hr rate.
+function buildRateLookup(peopleRows) {
+  const byEmail = {}, byName = {};
+  let count = 0;
+  for (const row of (peopleRows || [])) {
+    const rate = parseCompRate(row['Compensation Rate'] || row['Compensation Rate (USD)'] || row['Comp Rate']);
+    if (rate == null) continue;
+    const email = String(row['Email'] || '').trim().toLowerCase();
+    const name = normalizeName(row['Person Name'] || row['Name'] || row['Person'] || '').toLowerCase();
+    if (email) byEmail[email] = rate;
+    if (name) byName[name] = rate;
+    count++;
+  }
+  return { byEmail, byName, count };
+}
+
+// Fetch the People tab (Compensation Rate column) via the same &only= fast path
+// fetchApprovedHours uses, so the payroll table can show billable $ amounts.
+// Tolerant: never throws — returns {ok, lookup} or {ok:false, reason}.
+async function fetchPayrollRates() {
+  if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.startsWith('PASTE_'))
+    return { ok: false, reason: 'sheet not configured' };
+  const TIMEOUT_MS = 20000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const url = `${APPS_SCRIPT_URL}?token=${encodeURIComponent(APPS_SCRIPT_TOKEN)}`
+              + `&only=${encodeURIComponent(TAB_PEOPLE)}`;
+    const res = await fetch(url, { method: 'GET', signal: controller.signal });
+    if (!res.ok) return { ok: false, reason: `HTTP ${res.status}` };
+    const body = await res.json();
+    if (body.error) return { ok: false, reason: body.error };
+    const tab = body[TAB_PEOPLE];
+    if (!tab) return { ok: false, reason: `tab "${TAB_PEOPLE}" not in sheet response` };
+    if (tab.error) return { ok: false, reason: tab.error };
+    return { ok: true, lookup: buildRateLookup(tab) };
+  } catch (e) {
+    return { ok: false, reason: e.name === 'AbortError' ? `timed out after ${TIMEOUT_MS/1000}s` : e.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Resolve a payroll person's USD/hr rate from meta.rateLookup. email first,
+// then normalized name. Returns a number, or null if no rate on file.
+function payrollRateFor(p, meta) {
+  const lk = meta && meta.rateLookup;
+  if (!lk) return null;
+  const email = p.email ? String(p.email).trim().toLowerCase() : '';
+  if (email && lk.byEmail[email] != null) return lk.byEmail[email];
+  const name = normalizeName(p.name).toLowerCase();
+  if (name && lk.byName[name] != null) return lk.byName[name];
+  return null;
 }
 
 // Fetch the Additional Hours Request tab from the same Apps Script the
@@ -3967,7 +4059,26 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         // 2) Render flags IMMEDIATELY — the network never blocks this.
+        //    rateLookup is undefined until the People tab loads → Amount shows "…".
+        meta.rateLookup = undefined;
         show(runPayrollAnalysis(rows, meta, approvals));
+
+        // 2b) Background: pull per-person Compensation Rates from the People tab,
+        //     then re-render so the Amount column fills in. Independent of approvals.
+        fetchPayrollRates().then((r) => {
+          if (r.ok) {
+            meta.rateLookup = r.lookup;
+            meta.ratesNote = `Compensation rates: ${r.lookup.count} loaded from "${TAB_PEOPLE}".`;
+          } else {
+            meta.rateLookup = null;
+            meta.ratesNote = `Compensation rates not loaded (${r.reason}) — Amount column blank.`;
+          }
+          renderPayroll(lastPayrollAnalysis, meta);
+        }).catch((e) => {
+          meta.rateLookup = null;
+          meta.ratesNote = `Compensation rates not loaded (${e.message}) — Amount column blank.`;
+          renderPayroll(lastPayrollAnalysis, meta);
+        });
 
         // 3) Background: pull synced approvals, then re-render with suppression.
         //    Not awaited, so the button frees up and results are already visible.
