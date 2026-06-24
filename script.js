@@ -3915,20 +3915,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // Optional approvals upload (overrides the synced sheet when present).
-  const approvalsFile = document.getElementById('payroll-approvals-file');
-  const approvalsFileName = document.getElementById('payroll-approvals-name');
-  let approvalsFileText = null;
-  if (approvalsFile) {
-    approvalsFile.addEventListener('change', () => {
-      const f = approvalsFile.files && approvalsFile.files[0];
-      if (!f) { approvalsFileText = null; if (approvalsFileName) approvalsFileName.textContent = 'Approved hours CSV (optional)'; return; }
-      if (approvalsFileName) approvalsFileName.textContent = f.name;
-      const reader = new FileReader();
-      reader.onload = () => { approvalsFileText = reader.result; };
-      reader.readAsText(f);
-    });
-  }
+  // Approvals are pulled automatically from the synced "Additional Hours Request" tab.
 
   if (payrollAnalyzeBtn) {
     payrollAnalyzeBtn.addEventListener('click', async () => {
@@ -3938,19 +3925,19 @@ document.addEventListener('DOMContentLoaded', () => {
       payrollStatus.className = 'hint center';
       payrollStatus.textContent = 'Analyzing…';
       try {
-        const val = (id, def) => { const el = document.getElementById(id); const v = parseFloat(el && el.value); return Number.isFinite(v) ? v : def; };
-        const winStartStr = (document.getElementById('payroll-window-start') || {}).value || '08:00';
-        const winEndStr = (document.getElementById('payroll-window-end') || {}).value || '17:00';
+        // Fixed payroll rules (the settings UI was removed; these are the standard values).
+        const winStartStr = '08:00';
+        const winEndStr = '17:00';
         const meta = {
-          dailyLimit: val('payroll-limit', 8),
-          graceMin: val('payroll-grace', 0),
-          breakLimitMin: val('payroll-break-limit', 30),
-          breakGraceMin: val('payroll-break-grace', 2),
+          dailyLimit: 8,        // hrs
+          graceMin: 0,          // weekday overage grace
+          breakLimitMin: 30,    // daily break limit
+          breakGraceMin: 2,     // absorbs rounding (e.g. 30.4 min)
           winStartStr, winEndStr,
           winStartMin: parseClock(winStartStr) ?? 480,
           winEndMin: parseClock(winEndStr) ?? 1020,
-          winGraceMin: val('payroll-window-grace', 5),
-          flagWeekend: document.getElementById('payroll-flag-weekend').checked,
+          winGraceMin: 5,       // operational-window grace
+          flagWeekend: true,    // flag Sat/Sun work
           fileName: (payrollFile.files[0] && payrollFile.files[0].name) || 'report',
         };
         const rows = parsePayrollCSV(payrollFileText);
@@ -3972,16 +3959,9 @@ document.addEventListener('DOMContentLoaded', () => {
             : `Done. ${n} ${n === 1 ? 'person' : 'people'} flagged for review.${fmtNote}`) + supNote;
         };
 
-        // 1) Uploaded approvals (instant) take precedence.
+        // Approvals come from the synced "Additional Hours Request" tab (pulled in step 3).
         let approvals = null;
-        if (isCustom && approvalsFileText) {
-          approvals = buildApprovalIndexFromCSV(approvalsFileText);
-          meta.approvalsOk = approvals.detected.ok;
-          meta.approvalsNote = approvals.detected.ok
-            ? `Approvals: ${approvals.list.length} approved request${approvals.list.length===1?'':'s'} loaded from uploaded file.`
-            : `Approvals file uploaded but columns weren't recognized (need a status, date, and name/email column) — nothing suppressed.`;
-        } else if (isCustom) {
-          // We'll fetch the synced tab in the background (see step 3).
+        if (isCustom) {
           meta.approvalsNote = `Checking "${TAB_ADDITIONAL_HOURS}" for approvals…`;
           meta.approvalsOk = true;
         }
@@ -3991,7 +3971,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // 3) Background: pull synced approvals, then re-render with suppression.
         //    Not awaited, so the button frees up and results are already visible.
-        if (isCustom && !approvalsFileText) {
+        if (isCustom) {
           fetchApprovedHours().then((r) => {
             if (r.ok) {
               const appr = buildApprovalIndexFromObjects(r.rows);
@@ -4002,7 +3982,7 @@ document.addEventListener('DOMContentLoaded', () => {
               show(appr.detected.ok ? analyzePayrollCustom(rows, meta, appr) : lastPayrollAnalysis);
             } else {
               meta.approvalsOk = false;
-              meta.approvalsNote = `Approvals not loaded (${r.reason}) — nothing suppressed. Upload an approvals CSV to apply them.`;
+              meta.approvalsNote = `Approvals not loaded (${r.reason}) — nothing suppressed.`;
               renderPayroll(lastPayrollAnalysis, meta);   // refresh just the note
             }
           }).catch((e) => {
