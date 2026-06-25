@@ -3537,7 +3537,8 @@ function renderPayrollCustom(analysis, meta) {
   // dry-run preview; nothing is submitted to Deel until you flip dryRun off.
   html += `<div class="payroll-deel-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0;">`
         + `<button id="deel-send-btn" class="secondary-btn">⇪ Preview send to Deel</button>`
-        + `<span class="hint">Builds Deel timesheets from each person's billable hours + Contract ID. Dry run — preview only, nothing submitted.</span>`
+        + `<button id="deel-live-btn" class="secondary-btn" disabled title="Run a preview first" style="border-color:#b4541f;color:#b4541f;">⇪ Submit to Deel (live)</button>`
+        + `<span class="hint">Preview builds the timesheets (nothing submitted). Live submits them to Deel — enabled after a preview. Already-submitted periods are skipped automatically.</span>`
         + `</div>`
         + `<div id="deel-sync-panel" style="margin:8px 0 4px;" hidden></div>`;
 
@@ -3716,13 +3717,18 @@ function renderPayrollCustom(analysis, meta) {
     deelBtn.addEventListener('click', () =>
       sendPayrollToDeel(analysis, meta, deelBtn, wrap.querySelector('#deel-sync-panel')));
   }
+  const deelLiveBtn = wrap.querySelector('#deel-live-btn');
+  if (deelLiveBtn) {
+    deelLiveBtn.addEventListener('click', () =>
+      submitPayrollToDeelLive(analysis, meta, deelLiveBtn, wrap.querySelector('#deel-sync-panel')));
+  }
 }
 
 // Build the n8n/Deel payload from the resolved payroll people. Uses the same
 // rate + Contract ID resolvers the table uses, so what we send matches what's
 // shown on screen. dryRun defaults true — the webhook previews, never submits,
 // until this is explicitly set false.
-function buildDeelPayload(analysis, meta, dryRun) {
+function buildDeelPayload(analysis, meta, dryRun, confirm) {
   const all = analysis.flagged.concat(analysis.clean || []);
   const people = all.map((p) => ({
     name: p.name,
@@ -3738,6 +3744,7 @@ function buildDeelPayload(analysis, meta, dryRun) {
       label: analysis.dateRange || meta.fileName || '',
     },
     dryRun: dryRun !== false,   // default true
+    confirm: confirm === true,  // must be explicitly true for the live path to fire
     people,
   };
 }
@@ -3768,6 +3775,9 @@ async function sendPayrollToDeel(analysis, meta, btn, panel) {
     }
     const data = JSON.parse(text);
     panel.innerHTML = renderDeelPreview(data);
+    // A successful preview unlocks the live-submit button.
+    const lb = document.getElementById('deel-live-btn');
+    if (lb) { lb.disabled = false; lb.removeAttribute('title'); }
   } catch (e) {
     const hint = /Failed to fetch|NetworkError/i.test(e.message)
       ? ' (If using the test URL, click "Listen for test event" in n8n first; the test URL only accepts one call per listen.)'
@@ -3802,6 +3812,107 @@ function renderDeelPreview(data) {
   if (skipped.length) {
     h += `<details class="payroll-suppressed"><summary>${skipped.length} skipped (not sent)</summary><div class="payroll-clean-list">`
        + skipped.map(s => `<span>${escapeHTML(s.name || '')} — ${escapeHTML(s.reason || '')}</span>`).join('')
+       + `</div></details>`;
+  }
+  return h;
+}
+
+// Live submit — deliberately gated. The live button only enables after a
+// preview; the first click ARMS it, a second click within 5s confirms and
+// submits (dryRun:false + confirm:true). The n8n workflow's idempotency guard
+// skips any period already submitted, so a double-click or a re-run can't
+// double-pay.
+async function submitPayrollToDeelLive(analysis, meta, btn, panel) {
+  if (!panel) return;
+  panel.hidden = false;
+  if (!DEEL_WEBHOOK_URL || DEEL_WEBHOOK_URL.startsWith('PASTE_')) {
+    panel.innerHTML = `<div class="payroll-appr-note warn">Deel webhook URL isn't set.</div>`;
+    return;
+  }
+
+  // Stage 1 — arm. First click shows a confirmation and waits for a second click.
+  if (btn.dataset.armed !== '1') {
+    btn.dataset.armed = '1';
+    if (!btn.dataset.origLabel) btn.dataset.origLabel = btn.textContent;
+    btn.textContent = '⚠ Click again to confirm LIVE submit';
+    btn.style.background = '#b4541f';
+    btn.style.color = '#fff';
+    const peek = buildDeelPayload(analysis, meta, false, true);
+    const willSend = (peek.people || []).filter(p => p.contractId && Number(p.billableHours) > 0).length;
+    panel.innerHTML = `<div class="payroll-appr-note warn">This will submit <strong>${willSend}</strong> timesheet(s) to Deel for <strong>${escapeHTML((peek.period && peek.period.label) || '')}</strong>. Click the button again to confirm. Already-submitted periods are skipped automatically.</div>`;
+    clearTimeout(btn._disarmTimer);
+    btn._disarmTimer = setTimeout(() => {
+      btn.dataset.armed = '0';
+      btn.textContent = btn.dataset.origLabel || '⇪ Submit to Deel (live)';
+      btn.style.background = '';
+      btn.style.color = '#b4541f';
+    }, 5000);
+    return;
+  }
+
+  // Stage 2 — confirmed. Submit live.
+  clearTimeout(btn._disarmTimer);
+  btn.dataset.armed = '0';
+  const payload = buildDeelPayload(analysis, meta, false, true);   // live + confirm
+  const orig = btn.dataset.origLabel || '⇪ Submit to Deel (live)';
+  btn.disabled = true;
+  btn.textContent = 'Submitting to Deel…';
+  btn.style.background = '';
+  btn.style.color = '#b4541f';
+  panel.innerHTML = `<div class="payroll-appr-note">Submitting to Deel…</div>`;
+  try {
+    const res = await fetch(DEEL_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    if (!text) {
+      panel.innerHTML = `<div class="payroll-appr-note warn">n8n returned an empty response — make sure the workflow is Active and DEEL_WEBHOOK_URL points at the production webhook.</div>`;
+      return;
+    }
+    const data = JSON.parse(text);
+    panel.innerHTML = renderDeelLive(data);
+  } catch (e) {
+    panel.innerHTML = `<div class="payroll-appr-note warn">Live submit failed: ${escapeHTML(e.message)}. Re-running is safe — any timesheet already created is skipped on the next attempt.</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+// Render the live submission result (created / already-exists / review / errored).
+function renderDeelLive(data) {
+  data = data || {};
+  const c = data.counts || {};
+  const results = data.results || [];
+  const ineligible = data.skipped || [];
+  const allOk = data.ok !== false && !c.errored && !c.review;
+  let h = `<div class="payroll-appr-note ${allOk ? 'ok' : 'warn'}">`
+        + `⇪ LIVE submit complete — `
+        + `${c.created || 0} created · ${c.skippedDuplicate || 0} already existed · ${c.review || 0} review · ${c.errored || 0} errored`
+        + (data.period && data.period.label ? ` · ${escapeHTML(data.period.label)}` : '')
+        + `</div>`;
+  if (results.length) {
+    h += `<table class="detail-table"><thead><tr><th>Person</th><th class="num">Hours</th><th>Contract</th><th>Status</th><th>Timesheet / note</th></tr></thead><tbody>`;
+    for (const r of results) {
+      const st = r.status || '';
+      const stLabel = st === 'created' ? 'created'
+                    : st === 'skipped' ? 'already exists'
+                    : st === 'review' ? 'review' : (st || 'error');
+      const note = st === 'created' ? (r.timesheetId || '') : (r.error || r.timesheetId || '');
+      h += `<tr><td>${escapeHTML(r.name || '')}</td>`
+         + `<td class="num">${fmtHrs(Number(r.quantity) || 0)}</td>`
+         + `<td>${escapeHTML(r.contract_id || '')}</td>`
+         + `<td>${escapeHTML(stLabel)}</td>`
+         + `<td class="mono" style="font-size:11px;">${escapeHTML(String(note))}</td></tr>`;
+    }
+    h += `</tbody></table>`;
+  }
+  if (ineligible.length) {
+    h += `<details class="payroll-suppressed"><summary>${ineligible.length} not eligible (no contract / no hours)</summary><div class="payroll-clean-list">`
+       + ineligible.map(s => `<span>${escapeHTML(s.name || '')} — ${escapeHTML(s.reason || '')}</span>`).join('')
        + `</div></details>`;
   }
   return h;
