@@ -3554,6 +3554,7 @@ function renderPayrollCustom(analysis, meta) {
   // their day rows + a subtotal row live in the SAME table (same columns,
   // aligned), hidden until the person row is clicked.
   const fmtMin = (m) => { const r = Math.round(m); return r ? `${r}m` : '—'; };
+  const fmtBrkHrs = (h) => (h && Math.abs(h) >= 0.005) ? fmtHrs(h) : '—';  // break cols in decimal hrs
   const dayFlagChip = (code) => {
     const map = { H: 'pf-hours', R: 'pf-overreq', P: 'pf-pending', B: 'pf-break', O: 'pf-window', W: 'pf-weekend', Wk: 'pf-wknd-ok' };
     return `<span class="pf ${map[code] || ''}">${code}</span>`;
@@ -3596,8 +3597,8 @@ function renderPayrollCustom(analysis, meta) {
            + `<span class="payroll-email">${escapeHTML(p.email)}</span></td>`
            + `<td>${chips.join(' ') || '<span class="muted">—</span>'}</td>`
            + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
-           + `<td class="num">${fmtMin((p.totalPaidBreak || 0) * 60)}</td>`
-           + `<td class="num">${fmtMin((p.totalBreakRemoved || 0) * 60)}</td>`
+           + `<td class="num">${fmtBrkHrs(p.totalPaidBreak || 0)}</td>`
+           + `<td class="num">${fmtBrkHrs(p.totalBreakRemoved || 0)}</td>`
            + `<td class="num">${fmtReq(p.totalRequested)}</td>`
            + `<td class="num">${pendingCell}</td>`
            + `<td class="num">${p.totalDropped > HRS_EPS ? `<span class="pf pf-hours">${fmtHrs(p.totalDropped)}</span>` : '—'}</td>`
@@ -3612,8 +3613,8 @@ function renderPayrollCustom(analysis, meta) {
              + `<td class="payroll-day-cell">${escapeHTML(d.dayName)} ${escapeHTML(d.label)}</td>`
              + `<td>${dchips}</td>`
              + `<td class="num">${fmtHrs(d.tracked)}</td>`
-             + `<td class="num">${fmtMin(d.paidBrkMin)}</td>`
-             + `<td class="num">${fmtMin(d.removedMin)}</td>`
+             + `<td class="num">${fmtBrkHrs(d.paidBrkMin / 60)}</td>`
+             + `<td class="num">${fmtBrkHrs(d.removedMin / 60)}</td>`
              + `<td class="num">${fmtReq(d.reqHrs)}</td>`
              + `<td class="num">${d.pending > HRS_EPS ? fmtHrs(d.pending) : '—'}</td>`
              + `<td class="num">${d.capRemovedHrs > HRS_EPS ? `<span class="pf pf-hours">${fmtHrs(d.capRemovedHrs)}</span>` : '—'}</td>`
@@ -3625,8 +3626,8 @@ function renderPayrollCustom(analysis, meta) {
     html2 += `<tr class="payroll-child payroll-subtotal pid-${idx}" hidden>`
            + `<td><strong>Subtotal — ${escapeHTML(p.name)}</strong></td><td></td>`
            + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
-           + `<td class="num">${fmtMin((p.totalPaidBreak || 0) * 60)}</td>`
-           + `<td class="num">${fmtMin((p.totalBreakRemoved || 0) * 60)}</td>`
+           + `<td class="num">${fmtBrkHrs(p.totalPaidBreak || 0)}</td>`
+           + `<td class="num">${fmtBrkHrs(p.totalBreakRemoved || 0)}</td>`
            + `<td class="num">${fmtReq(p.totalRequested)}</td>`
            + `<td class="num">${p.totalPending > HRS_EPS ? fmtHrs(p.totalPending) : '—'}</td>`
            + `<td class="num">${p.totalDropped > HRS_EPS ? `<span class="pf pf-hours">${fmtHrs(p.totalDropped)}</span>` : '—'}</td>`
@@ -3644,8 +3645,8 @@ function renderPayrollCustom(analysis, meta) {
   html2 += `<tr class="payroll-grand-row">`
          + `<td><strong>GRAND TOTAL</strong> <span class="muted">— ${all.length} ${all.length === 1 ? 'person' : 'people'}</span></td><td></td>`
          + `<td class="num">${fmtHrs(sum('totalTracked'))}</td>`
-         + `<td class="num">${fmtMin(sum('totalPaidBreak') * 60)}</td>`
-         + `<td class="num">${fmtMin(sum('totalBreakRemoved') * 60)}</td>`
+         + `<td class="num">${fmtBrkHrs(sum('totalPaidBreak'))}</td>`
+         + `<td class="num">${fmtBrkHrs(sum('totalBreakRemoved'))}</td>`
          + `<td class="num">${fmtReq(sum('totalRequested'))}</td>`
          + `<td class="num">${sum('totalPending') > HRS_EPS ? fmtHrs(sum('totalPending')) : '—'}</td>`
          + `<td class="num"><strong>${sum('totalDropped') > HRS_EPS ? fmtHrs(sum('totalDropped')) : '—'}</strong></td>`
