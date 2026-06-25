@@ -34,6 +34,11 @@
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwrvtRktEP1nylsf3WaRRbpN4NtIIjrlARINsn0DKGFoYa1ipqgJKybjOrnFVcVCLpzLA/exec';
 const APPS_SCRIPT_TOKEN = '9EMY8RYSE5WUISFY2ZOBADP9F2FIOCDL';  // must match TOKEN in apps-script.gs
 
+// n8n webhook that builds Deel timesheets from the payroll billable output.
+// Use the test URL while validating, then switch to the production URL once the
+// workflow is Active:  https://acrexai.app.n8n.cloud/webhook/deel-timesheets
+const DEEL_WEBHOOK_URL = 'https://acrexai.app.n8n.cloud/webhook-test/deel-timesheets';
+
 // CC_RECIPIENT_NAME must match exactly how Anshul appears in the
 // "Person Name" column of the People tab. The send-emails flow looks
 // up his email from that row — no hardcoded address. If his name in
@@ -3504,7 +3509,13 @@ function analyzePayrollCustom(rows, opts, approvals) {
   suppressed.sort((a, b) => a.name.localeCompare(b.name));
 
   const dateRange = minLabel && maxLabel ? `${minLabel} – ${maxLabel}` : '';
-  return { format: 'custom', flagged, clean, suppressed, dateRange };
+  const ymdToISO = (n) => {
+    if (!n || !isFinite(n)) return '';
+    const y = Math.floor(n / 10000), m = Math.floor((n % 10000) / 100), d = n % 100;
+    return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  };
+  return { format: 'custom', flagged, clean, suppressed, dateRange,
+           periodStartISO: ymdToISO(minSort), periodEndISO: ymdToISO(maxSort) };
 }
 
 // Render the billable-hours + controls custom-export results.
@@ -3520,6 +3531,14 @@ function renderPayrollCustom(analysis, meta) {
            + `<span>Report: <strong>${escapeHTML(analysis.dateRange || meta.fileName)}</strong></span>`
            + `<span>${cap}h/day billable cap · paid break ${Math.round(PAID_BREAK_MAX_HRS*60)}m · window ${win} CT · ${flagged.length} of ${total} flagged</span>`
            + `</div>`;
+
+  // Deel sync toolbar — sends billable hours to the n8n webhook. Defaults to a
+  // dry-run preview; nothing is submitted to Deel until you flip dryRun off.
+  html += `<div class="payroll-deel-bar" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0;">`
+        + `<button id="deel-send-btn" class="secondary-btn">⇪ Preview send to Deel</button>`
+        + `<span class="hint">Builds Deel timesheets from each person's billable hours + Contract ID. Dry run — preview only, nothing submitted.</span>`
+        + `</div>`
+        + `<div id="deel-sync-panel" style="margin:8px 0 4px;" hidden></div>`;
 
   // Legend.
   html += `<div class="payroll-flag-legend">`
@@ -3689,6 +3708,97 @@ function renderPayrollCustom(analysis, meta) {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
     });
   });
+
+  // Wire the Deel sync button (lives inside the freshly rendered results).
+  const deelBtn = wrap.querySelector('#deel-send-btn');
+  if (deelBtn) {
+    deelBtn.addEventListener('click', () =>
+      sendPayrollToDeel(analysis, meta, deelBtn, wrap.querySelector('#deel-sync-panel')));
+  }
+}
+
+// Build the n8n/Deel payload from the resolved payroll people. Uses the same
+// rate + Contract ID resolvers the table uses, so what we send matches what's
+// shown on screen. dryRun defaults true — the webhook previews, never submits,
+// until this is explicitly set false.
+function buildDeelPayload(analysis, meta, dryRun) {
+  const all = analysis.flagged.concat(analysis.clean || []);
+  const people = all.map((p) => ({
+    name: p.name,
+    email: p.email,
+    billableHours: Math.round((p.totalBillable || 0) * 100) / 100,
+    rate: payrollRateFor(p, meta),
+    contractId: payrollContractIdFor(p, meta) || '',
+  }));
+  return {
+    period: {
+      end: analysis.periodEndISO || '',
+      start: analysis.periodStartISO || '',
+      label: analysis.dateRange || meta.fileName || '',
+    },
+    dryRun: dryRun !== false,   // default true
+    people,
+  };
+}
+
+// POST the payload to the n8n webhook and render the returned preview.
+async function sendPayrollToDeel(analysis, meta, btn, panel) {
+  if (!panel) return;
+  panel.hidden = false;
+  if (!DEEL_WEBHOOK_URL || DEEL_WEBHOOK_URL.startsWith('PASTE_')) {
+    panel.innerHTML = `<div class="payroll-appr-note warn">Deel webhook URL isn't set — add DEEL_WEBHOOK_URL near the top of script.js.</div>`;
+    return;
+  }
+  const payload = buildDeelPayload(analysis, meta, true);   // dry run
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Previewing…';
+  panel.innerHTML = `<div class="payroll-appr-note">Contacting n8n…</div>`;
+  try {
+    const res = await fetch(DEEL_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    panel.innerHTML = renderDeelPreview(data);
+  } catch (e) {
+    const hint = /Failed to fetch|NetworkError/i.test(e.message)
+      ? ' (If using the test URL, click "Listen for test event" in n8n first; the test URL only accepts one call per listen.)'
+      : '';
+    panel.innerHTML = `<div class="payroll-appr-note warn">Couldn't reach the Deel webhook: ${escapeHTML(e.message)}.${hint}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+// Render the preview the webhook returns (eligible payloads + skipped people).
+function renderDeelPreview(data) {
+  data = data || {};
+  const c = data.counts || {};
+  const dry = data.dryRun !== false;
+  const eligible = data.eligible || [];
+  const skipped = data.skipped || [];
+  let h = `<div class="payroll-appr-note ${dry ? 'ok' : 'warn'}">`
+        + (dry ? 'Preview only (dry run) — nothing submitted to Deel. ' : '⚠ LIVE — timesheets submitted to Deel. ')
+        + `${c.eligible || 0} eligible · ${c.skipped || 0} skipped · of ${c.received || 0} received`
+        + (data.period && data.period.label ? ` · ${escapeHTML(data.period.label)}` : '')
+        + `</div>`;
+  if (eligible.length) {
+    h += `<table class="detail-table"><thead><tr><th>Person</th><th class="num">Hours</th><th>Deel Contract</th></tr></thead><tbody>`;
+    for (const e of eligible) {
+      h += `<tr><td>${escapeHTML(e._name || '')}</td>`
+         + `<td class="num">${fmtHrs(Number(e.quantity) || 0)}</td>`
+         + `<td>${escapeHTML(e.contract_id || '')}</td></tr>`;
+    }
+    h += `</tbody></table>`;
+  }
+  if (skipped.length) {
+    h += `<details class="payroll-suppressed"><summary>${skipped.length} skipped (not sent)</summary><div class="payroll-clean-list">`
+       + skipped.map(s => `<span>${escapeHTML(s.name || '')} — ${escapeHTML(s.reason || '')}</span>`).join('')
+       + `</div></details>`;
+  }
+  return h;
 }
 
 function downloadPayrollCustomReport(analysis, meta) {
