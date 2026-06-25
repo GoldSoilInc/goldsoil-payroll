@@ -3595,11 +3595,17 @@ function renderPayrollCustom(analysis, meta) {
     const pendingCell = p.totalPending > HRS_EPS
       ? `<span class="pf pf-pending">${fmtHrs(p.totalPending)}</span>` : '—';
     const rate = payrollRateFor(p, meta);
+    const cid = payrollContractIdFor(p, meta);
+    const cidLine = cid
+      ? `<span class="payroll-email">Deel: ${escapeHTML(cid)}</span>`
+      : (p.totalBillable > HRS_EPS
+          ? `<span class="payroll-email" style="color:#B45309;">⚠ no Deel contract on People tab</span>`
+          : '');
 
     // Person header row.
     html2 += `<tr class="payroll-person-row${p.flagCount ? ' flag-review' : ''}" data-pid="${idx}" tabindex="0" role="button" aria-expanded="false">`
            + `<td><span class="payroll-toggle">▸</span> <strong>${escapeHTML(p.name)}</strong>${groupTag}`
-           + `<span class="payroll-email">${escapeHTML(p.email)}</span></td>`
+           + `<span class="payroll-email">${escapeHTML(p.email)}</span>${cidLine}</td>`
            + `<td>${chips.join(' ') || '<span class="muted">—</span>'}</td>`
            + `<td class="num">${fmtHrs(p.totalTracked)}</td>`
            + `<td class="num">${fmtBrkHrs(p.totalPaidBreak || 0)}</td>`
@@ -3691,7 +3697,7 @@ function downloadPayrollCustomReport(analysis, meta) {
   const all = analysis.flagged.concat(analysis.clean || []);
 
   // Sheet 1 content: per-person summary (tracked / billable / pending / break removed).
-  const lines = [['Name', 'Email', 'User group', 'Total Tracked (h)', 'Total Billable (h)', 'Comp Rate (USD/h)', 'Billable Amount (USD)', 'Excess Break Removed (min)', 'Additional Hrs Requested (h)', 'Pending Approval (h)', 'Cap Removed No Request (h)', 'Flags'].join(',')];
+  const lines = [['Name', 'Email', 'User group', 'Deel Contract ID', 'Total Tracked (h)', 'Total Billable (h)', 'Comp Rate (USD/h)', 'Billable Amount (USD)', 'Excess Break Removed (min)', 'Additional Hrs Requested (h)', 'Pending Approval (h)', 'Cap Removed No Request (h)', 'Flags'].join(',')];
   for (const p of all) {
     const flags = [
       p.droppedDays.length ? `H${p.droppedDays.length}` : '',
@@ -3702,8 +3708,9 @@ function downloadPayrollCustomReport(analysis, meta) {
       p.weekendDays.length ? `W${p.weekendDays.length}` : '',
     ].filter(Boolean).join(' ');
     const rate = payrollRateFor(p, meta);
+    const cid = payrollContractIdFor(p, meta);
     lines.push([
-      csvEscape(p.name), csvEscape(p.email), csvEscape(p.group),
+      csvEscape(p.name), csvEscape(p.email), csvEscape(p.group), csvEscape(cid || ''),
       p.totalTracked.toFixed(2), p.totalBillable.toFixed(2),
       rate != null ? rate.toFixed(2) : '', rate != null ? (p.totalBillable * rate).toFixed(2) : '',
       Math.round(p.totalBreakRemoved * 60), (p.totalRequested || 0).toFixed(2),
@@ -3739,19 +3746,27 @@ function downloadPayrollCustomReport(analysis, meta) {
 // and by lowercased normalized name (fallback). Value is the USD/hr rate.
 function buildRateLookup(peopleRows) {
   const byEmail = {}, byName = {}, list = [];
+  const cidByEmail = {}, cidByName = {};   // Deel Contract ID (People tab "Contract ID")
   let count = 0;
   for (const row of (peopleRows || [])) {
     const rate = parseCompRate(row['Compensation Rate'] || row['Compensation Rate (USD)'] || row['Comp Rate']);
-    if (rate == null) continue;
+    const cid = String(row['Contract ID'] || row['Deel Contract ID'] || '').trim();
+    if (rate == null && !cid) continue;
     const email = String(row['Email'] || '').trim().toLowerCase();
     const rawName = normalizeName(row['Person Name'] || row['Name'] || row['Person'] || '');
     const name = rawName.toLowerCase();
-    if (email) byEmail[email] = rate;
-    if (name) byName[name] = rate;
-    list.push({ name: rawName, rate });   // for tolerant fallback (middle names, etc.)
-    count++;
+    if (rate != null) {
+      if (email) byEmail[email] = rate;
+      if (name) byName[name] = rate;
+      count++;
+    }
+    if (cid) {
+      if (email) cidByEmail[email] = cid;
+      if (name) cidByName[name] = cid;
+    }
+    list.push({ name: rawName, rate, contractId: cid || null });   // for tolerant fallback (middle names, etc.)
   }
-  return { byEmail, byName, list, count };
+  return { byEmail, byName, list, count, cidByEmail, cidByName };
 }
 
 // Fetch the People tab (Compensation Rate column) via the same &only= fast path
@@ -3800,6 +3815,26 @@ function payrollRateFor(p, meta) {
       if (tolerantNameMatch(p.name, e.name)) { hit = e; if (++n > 1) break; }
     }
     if (n === 1) return hit.rate;
+  }
+  return null;
+}
+
+// Resolve a payroll person's Deel Contract ID from meta.rateLookup, using the
+// same email → name → single-tolerant-match precedence as payrollRateFor.
+// Returns the contract id string, or null if none on file / ambiguous.
+function payrollContractIdFor(p, meta) {
+  const lk = meta && meta.rateLookup;
+  if (!lk || !lk.cidByEmail) return null;
+  const email = p.email ? String(p.email).trim().toLowerCase() : '';
+  if (email && lk.cidByEmail[email]) return lk.cidByEmail[email];
+  const name = normalizeName(p.name).toLowerCase();
+  if (name && lk.cidByName[name]) return lk.cidByName[name];
+  if (p.name && lk.list && lk.list.length) {
+    let hit = null, n = 0;
+    for (const e of lk.list) {
+      if (tolerantNameMatch(p.name, e.name)) { hit = e; if (++n > 1) break; }
+    }
+    if (n === 1 && hit.contractId) return hit.contractId;
   }
   return null;
 }
