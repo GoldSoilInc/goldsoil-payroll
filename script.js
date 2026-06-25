@@ -3948,7 +3948,7 @@ document.addEventListener('DOMContentLoaded', () => {
           winStartMin: parseClock(winStartStr) ?? 480,
           winEndMin: parseClock(winEndStr) ?? 1020,
           winGraceMin: val('payroll-window-grace', 5),
-          flagWeekend: document.getElementById('payroll-flag-weekend').checked,
+          flagWeekend: (document.getElementById('payroll-flag-weekend') || {}).checked ?? true,
           fileName: (payrollFile.files[0] && payrollFile.files[0].name) || 'report',
         };
         const rows = parsePayrollCSV(payrollFileText);
