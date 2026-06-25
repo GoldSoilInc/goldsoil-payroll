@@ -3570,12 +3570,17 @@ function renderPayrollCustom(analysis, meta) {
     if (rate == null) return '<span class="muted">—</span>';
     return fmtUSD(hours * rate);
   };
+  const rateCell = (rate) => {
+    if (ratesLoading) return '<span class="muted">…</span>';
+    if (rate == null) return '<span class="muted">—</span>';
+    return fmtUSD(rate);
+  };
   let html2 = `<table class="detail-table payroll-table payroll-billable-table"><thead><tr>`
             + `<th>Name / Day</th><th>Flags</th>`
             + `<th class="num">Tracked</th><th class="num">Break</th>`
             + `<th class="num">Excess Brk</th><th class="num">Requested</th><th class="num">Pending</th>`
             + `<th class="num">Cap Removed</th>`
-            + `<th class="num">Billable</th><th class="num">Amount (USD)</th>`
+            + `<th class="num">Billable</th><th class="num">Rate (USD/h)</th><th class="num">Amount (USD)</th>`
             + `</tr></thead><tbody>`;
 
   all.forEach((p, idx) => {
@@ -3603,6 +3608,7 @@ function renderPayrollCustom(analysis, meta) {
            + `<td class="num">${pendingCell}</td>`
            + `<td class="num">${p.totalDropped > HRS_EPS ? `<span class="pf pf-hours">${fmtHrs(p.totalDropped)}</span>` : '—'}</td>`
            + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
+           + `<td class="num">${rateCell(rate)}</td>`
            + `<td class="num"><strong>${amtCell(p.totalBillable, rate)}</strong></td>`
            + `</tr>`;
 
@@ -3619,6 +3625,7 @@ function renderPayrollCustom(analysis, meta) {
              + `<td class="num">${d.pending > HRS_EPS ? fmtHrs(d.pending) : '—'}</td>`
              + `<td class="num">${d.capRemovedHrs > HRS_EPS ? `<span class="pf pf-hours">${fmtHrs(d.capRemovedHrs)}</span>` : '—'}</td>`
              + `<td class="num"><strong>${fmtHrs(d.billable)}</strong></td>`
+             + `<td class="num">${rateCell(rate)}</td>`
              + `<td class="num">${amtCell(d.billable, rate)}</td>`
              + `</tr>`;
     }
@@ -3632,6 +3639,7 @@ function renderPayrollCustom(analysis, meta) {
            + `<td class="num">${p.totalPending > HRS_EPS ? fmtHrs(p.totalPending) : '—'}</td>`
            + `<td class="num">${p.totalDropped > HRS_EPS ? `<span class="pf pf-hours">${fmtHrs(p.totalDropped)}</span>` : '—'}</td>`
            + `<td class="num"><strong>${fmtHrs(p.totalBillable)}</strong></td>`
+           + `<td class="num">${rateCell(rate)}</td>`
            + `<td class="num"><strong>${amtCell(p.totalBillable, rate)}</strong></td>`
            + `</tr>`;
   });
@@ -3651,6 +3659,7 @@ function renderPayrollCustom(analysis, meta) {
          + `<td class="num">${sum('totalPending') > HRS_EPS ? fmtHrs(sum('totalPending')) : '—'}</td>`
          + `<td class="num"><strong>${sum('totalDropped') > HRS_EPS ? fmtHrs(sum('totalDropped')) : '—'}</strong></td>`
          + `<td class="num"><strong>${fmtHrs(sum('totalBillable'))}</strong></td>`
+         + `<td class="num"><span class="muted">—</span></td>`
          + `<td class="num"><strong>${grandAmtCell}</strong></td>`
          + `</tr>`;
   html2 += `</tbody></table>`;
