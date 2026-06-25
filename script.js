@@ -35,9 +35,10 @@ const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwrvtRktEP1nyls
 const APPS_SCRIPT_TOKEN = '9EMY8RYSE5WUISFY2ZOBADP9F2FIOCDL';  // must match TOKEN in apps-script.gs
 
 // n8n webhook that builds Deel timesheets from the payroll billable output.
-// Use the test URL while validating, then switch to the production URL once the
-// workflow is Active:  https://acrexai.app.n8n.cloud/webhook/deel-timesheets
-const DEEL_WEBHOOK_URL = 'https://acrexai.app.n8n.cloud/webhook-test/deel-timesheets';
+// Production URL (workflow is Active). For ad-hoc testing you can swap in the
+// test URL (https://acrexai.app.n8n.cloud/webhook-test/deel-timesheets), but
+// the test URL only responds while "Listen for test event" is armed.
+const DEEL_WEBHOOK_URL = 'https://acrexai.app.n8n.cloud/webhook/deel-timesheets';
 
 // CC_RECIPIENT_NAME must match exactly how Anshul appears in the
 // "Person Name" column of the People tab. The send-emails flow looks
@@ -3760,7 +3761,12 @@ async function sendPayrollToDeel(analysis, meta, btn, panel) {
       body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const text = await res.text();
+    if (!text) {
+      panel.innerHTML = `<div class="payroll-appr-note warn">n8n received the request but returned an empty response. This happens with the <em>test</em> URL or an inactive workflow — make sure the workflow is Active and DEEL_WEBHOOK_URL points at the production webhook (/webhook/…, not /webhook-test/…).</div>`;
+      return;
+    }
+    const data = JSON.parse(text);
     panel.innerHTML = renderDeelPreview(data);
   } catch (e) {
     const hint = /Failed to fetch|NetworkError/i.test(e.message)
